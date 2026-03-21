@@ -1,0 +1,50 @@
+// app/predictions/page.tsx
+import { getDailySummaries } from '../../lib/supabase'
+import { PredictionsTable } from '../../components/PredictionsTable'
+
+export const revalidate = 60
+
+export default async function PredictionsPage() {
+  const summaries = await getDailySummaries(365)
+
+  const resolved  = summaries?.filter(s => s.actual_temp !== null) ?? []
+  const pending   = summaries?.filter(s => s.actual_temp === null) ?? []
+  const winRate   = resolved.length
+    ? ((resolved.filter(s => s.won).length / resolved.length) * 100).toFixed(1)
+    : null
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold text-white">Predicciones</h1>
+          <p className="text-gray-400 text-sm mt-1">
+            Historial completo · {summaries?.length ?? 0} entradas
+          </p>
+        </div>
+        <div className="text-right">
+          {winRate && (
+            <p className="text-lg font-semibold text-white">{winRate}%</p>
+          )}
+          <p className="text-xs text-gray-500">hit rate histórico</p>
+        </div>
+      </div>
+
+      {pending.length > 0 && (
+        <section className="bg-gray-900 border border-yellow-900/50 rounded-xl p-4">
+          <p className="text-xs text-yellow-600 font-medium mb-3">
+            ⏳ Pendientes de resolver ({pending.length})
+          </p>
+          <PredictionsTable summaries={pending} />
+        </section>
+      )}
+
+      <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <h2 className="text-sm font-medium text-gray-300 mb-4">
+          Resueltas ({resolved.length})
+        </h2>
+        <PredictionsTable summaries={resolved} />
+      </section>
+    </div>
+  )
+}
