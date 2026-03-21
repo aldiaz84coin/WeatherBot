@@ -1,7 +1,6 @@
 {
   "name": "madrid-temp-bot",
   "private": true,
-  "packageManager": "pnpm@9.0.0",
   "workspaces": [
     "packages/bot",
     "packages/dashboard"
