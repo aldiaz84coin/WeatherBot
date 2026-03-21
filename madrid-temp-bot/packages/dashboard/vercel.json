@@ -1,9 +1,6 @@
 {
   "framework": "nextjs",
-  "installCommand": "npm install -g pnpm@8.15.4 && pnpm install --no-frozen-lockfile",
-  "buildCommand": "pnpm build",
-  "outputDirectory": ".next",
-  "env": {
-    "NODE_VERSION": "20"
-  }
+  "installCommand": "npm install",
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next"
 }
