@@ -3,9 +3,9 @@
 
 import { getPerformance, getDailySummaries, getLatestTrainingRun } from '../lib/supabase'
 import { BotStatus } from '../components/BotStatus'
-import { KpiCard } from '../components/KpiCard'
+import { PredictionCard } from '../components/PredictionCard'
 import { PnlChart } from '../components/PnlChart'
-import { PredictionsTable } from '../components/PredictionsTable'
+import { TrainingResults } from '../components/TrainingResults'
 
 export const revalidate = 60 // revalidar cada 60s
 
@@ -34,24 +34,24 @@ export default async function HomePage() {
 
       {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <KpiCard
+        <PredictionCard
           label="Hit Rate"
           value={perf ? `${perf.hit_rate_pct}%` : '—'}
           sublabel="objetivo ≥ 90%"
           highlight={perf ? parseFloat(perf.hit_rate_pct) >= 90 : false}
         />
-        <KpiCard
+        <PredictionCard
           label="Operaciones"
           value={perf ? String(perf.total) : '—'}
           sublabel={`${perf?.wins ?? 0}W / ${perf?.losses ?? 0}L`}
         />
-        <KpiCard
+        <PredictionCard
           label="P&L Acumulado"
           value={perf ? `${Number(perf.cumulative_pnl) >= 0 ? '+' : ''}${perf.cumulative_pnl} USDC` : '—'}
           sublabel="neto tras costes"
           positive={perf ? Number(perf.cumulative_pnl) >= 0 : undefined}
         />
-        <KpiCard
+        <PredictionCard
           label="P&L Medio/Día"
           value={perf ? `${Number(perf.avg_daily_pnl) >= 0 ? '+' : ''}${perf.avg_daily_pnl} USDC` : '—'}
           sublabel="promedio diario"
@@ -117,7 +117,7 @@ export default async function HomePage() {
             Ver todas →
           </a>
         </div>
-        <PredictionsTable summaries={summaries?.slice(0, 10) ?? []} />
+        <TrainingResults summaries={summaries?.slice(0, 10) ?? []} />
       </section>
 
     </div>

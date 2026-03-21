@@ -1,6 +1,6 @@
 // app/predictions/page.tsx
 import { getDailySummaries } from '../../lib/supabase'
-import { PredictionsTable } from '../../components/PredictionsTable'
+import { TrainingResults } from '../../components/TrainingResults'
 
 export const revalidate = 60
 
@@ -35,7 +35,7 @@ export default async function PredictionsPage() {
           <p className="text-xs text-yellow-600 font-medium mb-3">
             ⏳ Pendientes de resolver ({pending.length})
           </p>
-          <PredictionsTable summaries={pending} />
+          <TrainingResults summaries={pending} />
         </section>
       )}
 
@@ -43,7 +43,7 @@ export default async function PredictionsPage() {
         <h2 className="text-sm font-medium text-gray-300 mb-4">
           Resueltas ({resolved.length})
         </h2>
-        <PredictionsTable summaries={resolved} />
+        <TrainingResults summaries={resolved} />
       </section>
     </div>
   )

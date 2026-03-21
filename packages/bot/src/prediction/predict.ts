@@ -5,9 +5,10 @@ import 'dotenv/config'
 import { format, addDays } from 'date-fns'
 import { supabase } from '../db/supabase'
 import { setupManager } from '../training/setup'
-import { GammaClient } from '../polymarket/gamma'
+import { buildPosition } from './position'
+import { ClobClient } from '../polymarket/clob'
 
-const COST_DISTRIBUTION = { low: 0.20, mid: 0.40, high: 0.20 }  // total = 0.80
+const COST_DISTRIBUTION = { low: 0.20, mid: 0.40, high: 0.20 }
 
 export async function runDailyPrediction() {
   const tomorrow = format(addDays(new Date(), 1), 'yyyy-MM-dd')
@@ -16,7 +17,7 @@ export async function runDailyPrediction() {
   console.log(`\n🌡️  Predicción para: ${tomorrow}`)
   console.log(`   Modo: ${isLive ? '🔴 LIVE' : '🟡 SIMULACIÓN'}`)
 
-  // 1. Cargar pesos óptimos del último training_run exitoso
+  // 1. Cargar pesos del último training_run exitoso
   const { data: latestRun } = await supabase
     .from('training_runs')
     .select('best_ensemble')
@@ -28,39 +29,27 @@ export async function runDailyPrediction() {
   const weights = latestRun?.best_ensemble ?? undefined
   const manager = await setupManager(weights)
 
-  // 2. Obtener ensemble
+  // 2. Obtener predicción del ensemble
   const ensemble = await manager.getEnsembleForecast(tomorrow)
   console.log(`   Ensemble: ${ensemble.ensembleTemp.toFixed(1)}°C`)
   console.log(`   Fuentes: ${JSON.stringify(ensemble.sourceTemps)}`)
 
-  // 3. Construir los 3 tokens
-  const pred = Math.round(ensemble.ensembleTemp)
-  const tokens = {
-    low:  pred - 1,
-    mid:  pred,
-    high: pred + 1,
-  }
-  console.log(`   Tokens: [${tokens.low}°, ${tokens.mid}°, ${tokens.high}°]`)
+  // 3. Construir los 3 tokens con precios de Polymarket
+  const position = await buildPosition(ensemble.ensembleTemp, tomorrow)
+  console.log(`   Tokens: [${position.tokens.map(t => `${t.tempCelsius}°`).join(', ')}]`)
+  console.log(`   Coste total: ${position.totalCostUsdc} USDC`)
+  console.log(`   Mercado disponible: ${position.marketAvailable}`)
 
-  // 4. Verificar precios en Polymarket
-  const gamma = new GammaClient()
-  const prices: Record<string, number | null> = {}
-  for (const [pos, temp] of Object.entries(tokens)) {
-    const daySlug = `highest-temperature-in-madrid-on-${format(addDays(new Date(), 1), 'MMMM-d-yyyy').toLowerCase()}`
-    // Los mercados reales usarán slugs específicos por temperatura
-    prices[pos] = await gamma.getTokenPrice(daySlug)
-  }
-
-  // 5. Guardar predicción en Supabase
+  // 4. Guardar predicción en Supabase
   const { data: prediction, error } = await supabase
     .from('predictions')
     .insert({
       target_date:     tomorrow,
       ensemble_temp:   ensemble.ensembleTemp,
       source_temps:    ensemble.sourceTemps,
-      token_low:       tokens.low,
-      token_mid:       tokens.mid,
-      token_high:      tokens.high,
+      token_low:       position.tokens[0].tempCelsius,
+      token_mid:       position.tokens[1].tempCelsius,
+      token_high:      position.tokens[2].tempCelsius,
       cost_low_usdc:   COST_DISTRIBUTION.low,
       cost_mid_usdc:   COST_DISTRIBUTION.mid,
       cost_high_usdc:  COST_DISTRIBUTION.high,
@@ -75,17 +64,40 @@ export async function runDailyPrediction() {
     return
   }
 
-  // 6. Guardar trades (simulados o reales)
-  for (const [position, temp] of Object.entries(tokens)) {
+  // 5. Guardar trades + ejecutar si LIVE
+  const clob = isLive ? new ClobClient(
+    process.env.POLYMARKET_API_KEY!,
+    process.env.POLYMARKET_PRIVATE_KEY!
+  ) : null
+
+  for (const token of position.tokens) {
+    let polymarketOrderId: string | null = null
+
+    if (isLive && clob && token.priceAtBuy && position.marketAvailable) {
+      try {
+        const order = await clob.placeOrder({
+          tokenId: token.slug,
+          side: 'BUY',
+          price: token.priceAtBuy,
+          size: token.costUsdc,
+        })
+        polymarketOrderId = order.orderId
+        console.log(`   ✅ Orden ejecutada: ${token.slug} → ${order.orderId}`)
+      } catch (err) {
+        console.error(`   ❌ Error ejecutando orden ${token.slug}:`, err)
+      }
+    }
+
     await supabase.from('trades').insert({
-      prediction_id:  prediction.id,
-      slug:           `highest-temperature-in-madrid-${temp}c-on-${format(addDays(new Date(), 1), 'MMMM-d-yyyy').toLowerCase()}`,
-      token_temp:     temp,
-      position,
-      cost_usdc:      COST_DISTRIBUTION[position as keyof typeof COST_DISTRIBUTION],
-      price_at_buy:   prices[position],
-      shares:         prices[position] ? COST_DISTRIBUTION[position as keyof typeof COST_DISTRIBUTION] / prices[position]! : null,
-      simulated:      !isLive,
+      prediction_id:       prediction.id,
+      slug:                token.slug,
+      token_temp:          token.tempCelsius,
+      position:            token.position,
+      cost_usdc:           token.costUsdc,
+      price_at_buy:        token.priceAtBuy,
+      shares:              token.shares,
+      simulated:           !isLive,
+      polymarket_order_id: polymarketOrderId,
     })
   }
 

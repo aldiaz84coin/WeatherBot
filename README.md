@@ -67,28 +67,29 @@ madrid-temp-bot/
 │   ├── bot/                        # Railway — Node.js / TypeScript
 │   │   ├── src/
 │   │   │   ├── sources/            # Adaptadores para cada fuente de datos
-│   │   │   │   ├── aemet.ts
-│   │   │   │   ├── open-meteo.ts
+│   │   │   │   ├── index.ts        # WeatherSource interface + WeatherSourceManager
+│   │   │   │   ├── aemet.ts        # AEMET (oficial España)
+│   │   │   │   ├── open-meteo.ts   # Open-Meteo (gratuita, ERA5-land)
+│   │   │   │   ├── visual-crossing.ts
 │   │   │   │   ├── openweathermap.ts
 │   │   │   │   ├── accuweather.ts
 │   │   │   │   ├── weatherapi.ts
-│   │   │   │   ├── visual-crossing.ts
 │   │   │   │   ├── meteored.ts
 │   │   │   │   ├── windy.ts
 │   │   │   │   ├── tomorrow-io.ts
-│   │   │   │   ├── copernicus.ts
-│   │   │   │   └── index.ts        # WeatherSourceManager
+│   │   │   │   └── copernicus.ts   # ERA5 ground truth (vía Open-Meteo Archive)
 │   │   │   ├── training/
 │   │   │   │   ├── backtest.ts     # ⭐ Loop de 365 días
-│   │   │   │   ├── ensemble.ts     # Optimización de pesos
-│   │   │   │   └── validator.ts    # Criterio 90% / validación cruzada
+│   │   │   │   ├── ensemble.ts     # Optimización de pesos por RMSE + grid search
+│   │   │   │   ├── validator.ts    # Validación cruzada temporal (OOS 90 días)
+│   │   │   │   └── setup.ts        # Inicializa WeatherSourceManager con las fuentes activas
 │   │   │   ├── polymarket/
-│   │   │   │   ├── gamma.ts        # Leer mercados y precios
-│   │   │   │   ├── clob.ts         # Ejecutar órdenes (real)
-│   │   │   │   └── slugs.ts        # Generador de slugs diarios
+│   │   │   │   ├── gamma.ts        # Gamma API — leer mercados y precios
+│   │   │   │   ├── clob.ts         # CLOB API — ejecutar órdenes reales (LIVE_TRADING)
+│   │   │   │   └── slugs.ts        # Generador de slugs diarios y por temperatura
 │   │   │   ├── prediction/
-│   │   │   │   ├── predict.ts      # Predicción del día siguiente
-│   │   │   │   └── position.ts     # Construcción de los 3 tokens
+│   │   │   │   ├── predict.ts      # Predicción del día siguiente + guardado en Supabase
+│   │   │   │   └── position.ts     # Construcción de los 3 tokens (presupuesto < 0.80 USDC)
 │   │   │   ├── db/
 │   │   │   │   └── supabase.ts     # Cliente Supabase + helpers
 │   │   │   ├── scheduler.ts        # Cron job 18:00 CET
@@ -99,26 +100,40 @@ madrid-temp-bot/
 │   └── dashboard/                  # Vercel — Next.js 14 App Router
 │       ├── app/
 │       │   ├── page.tsx            # Overview: estado bot + P&L
-│       │   ├── predictions/        # Historial de predicciones
-│       │   ├── training/           # Resultados del backtest
+│       │   ├── layout.tsx          # Layout global con nav
+│       │   ├── globals.css
+│       │   ├── predictions/
+│       │   │   └── page.tsx        # Historial completo de predicciones
+│       │   ├── training/
+│       │   │   └── page.tsx        # Resultados del backtest y pesos del ensemble
 │       │   └── api/
-│       │       └── revalidate/     # Webhook desde Supabase realtime
+│       │       └── revalidate/
+│       │           └── route.ts    # Webhook desde Supabase → revalida caché Next.js
 │       ├── components/
-│       │   ├── BotStatus.tsx
-│       │   ├── PredictionCard.tsx
-│       │   ├── PnlChart.tsx
-│       │   └── TrainingResults.tsx
+│       │   ├── BotStatus.tsx       # Indicador live/simulación
+│       │   ├── PredictionCard.tsx  # KPI card reutilizable
+│       │   ├── PnlChart.tsx        # Gráfico P&L acumulado (recharts)
+│       │   └── TrainingResults.tsx # Tabla de predicciones y resultados
 │       ├── lib/
-│       │   └── supabase.ts
+│       │   └── supabase.ts         # Cliente Supabase + tipos + queries
+│       ├── vercel.json
+│       ├── next.config.js
+│       ├── tailwind.config.js
+│       ├── postcss.config.js
+│       ├── tsconfig.json
 │       └── package.json
 │
 ├── supabase/
 │   └── migrations/
-│       ├── 001_initial_schema.sql
-│       └── 002_training_results.sql
+│       ├── 001_initial_schema.sql  # Schema completo: tablas, vistas, RLS
+│       └── 002_training_results.sql # Vistas adicionales, índices, función hit_rate_last_n_days
 │
 ├── .env.example
-├── package.json                    # Workspace raíz (pnpm)
+├── .npmrc
+├── .node-version
+├── .gitignore
+├── package.json                    # Workspace raíz
+├── railway.toml                    # Config de despliegue en Railway
 └── README.md
 ```
 
