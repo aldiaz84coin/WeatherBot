@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-win: #22c55e;
+  --color-loss: #ef4444;
+  --color-sim: #f59e0b;
+}

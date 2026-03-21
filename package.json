@@ -1,0 +1,15 @@
+{
+  "name": "madrid-temp-bot",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "packages/bot",
+    "packages/dashboard"
+  ],
+  "scripts": {
+    "bot": "pnpm --filter bot dev",
+    "dashboard": "pnpm --filter dashboard dev",
+    "backtest": "pnpm --filter bot backtest",
+    "build": "pnpm --filter bot build && pnpm --filter dashboard build"
+  }
+}

@@ -1,0 +1,11 @@
+[build]
+buildCommand = "cd packages/bot && pnpm install && pnpm build"
+
+[deploy]
+startCommand = "cd packages/bot && node dist/index.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[environments.production.variables]
+TZ = "Europe/Madrid"
+NODE_ENV = "production"
