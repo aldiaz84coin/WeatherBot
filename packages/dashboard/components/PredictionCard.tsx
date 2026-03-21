@@ -1,4 +1,4 @@
-// components/KpiCard.tsx
+// components/PredictionCard.tsx
 interface Props {
   label: string
   value: string
@@ -7,7 +7,7 @@ interface Props {
   positive?: boolean
 }
 
-export function KpiCard({ label, value, sublabel, highlight, positive }: Props) {
+export function PredictionCard({ label, value, sublabel, highlight, positive }: Props) {
   const valueColor = positive === true
     ? 'text-green-400'
     : positive === false
