@@ -1,11 +1,11 @@
-// components/PredictionsTable.tsx
+// components/TrainingResults.tsx
 import type { DailySummary } from '../lib/supabase'
 import { format, parseISO } from 'date-fns'
 import { es } from 'date-fns/locale'
 
 interface Props { summaries: DailySummary[] }
 
-export function PredictionsTable({ summaries }: Props) {
+export function TrainingResults({ summaries }: Props) {
   if (!summaries.length) {
     return <p className="text-gray-600 text-sm text-center py-8">Sin predicciones todavía</p>
   }
