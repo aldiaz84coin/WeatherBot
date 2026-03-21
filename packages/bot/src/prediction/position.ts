@@ -16,7 +16,7 @@ const BUDGET_DISTRIBUTION = {
 
 const TOTAL_BUDGET = Object.values(BUDGET_DISTRIBUTION).reduce((a, b) => a + b, 0)
 // Compile-time guard
-if (TOTAL_BUDGET >= 0.80) throw new Error('BUG: budget exceeds 0.80 USDC limit')
+if (TOTAL_BUDGET > 0.80) throw new Error('BUG: budget exceeds 0.80 USDC limit')
 
 export interface TokenPosition {
   position: 'low' | 'mid' | 'high'
