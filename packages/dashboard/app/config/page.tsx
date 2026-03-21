@@ -79,24 +79,87 @@ export default async function ConfigPage() {
       <section className="bg-gray-900 border-2 border-dashed border-yellow-900/60 rounded-xl p-5">
         <div className="flex items-start gap-4">
           <div className="text-2xl">⭐</div>
-          <div>
-            <h2 className="text-yellow-500 font-semibold text-sm mb-1">Objetivo de la Fase 1</h2>
-            <p className="text-gray-300 text-sm leading-relaxed">
-              Comprar tokens de temperatura en Polymarket donde la{' '}
-              <strong className="text-white">suma de precios &lt; {budget} USDC</strong>.
-              Si algún token resuelve en YES (temperatura real), la ganancia mínima garantizada es{' '}
-              <strong className="text-green-400">{(1 - budget).toFixed(2)} USDC</strong>.
+          <div className="flex-1 min-w-0">
+
+            <h2 className="text-yellow-500 font-semibold text-sm mb-2">Objetivo de la Fase 1</h2>
+
+            {/* Descripción principal */}
+            <p className="text-gray-300 text-sm leading-relaxed mb-3">
+              Comprar <strong className="text-white">N tokens</strong> de cada una de las 3
+              temperaturas candidatas en Polymarket, donde la{' '}
+              <strong className="text-white">
+                suma de precios unitarios &lt; {budget} USDC
+              </strong>.{' '}
+              Si algún token resuelve en YES (temperatura real), los N tokens ganadores valen{' '}
+              <strong className="text-white">N × 1 USDC</strong>, cubriendo el coste total y
+              garantizando una ganancia mínima de{' '}
+              <strong className="text-green-400">
+                N × {(1 - budget).toFixed(2)} USDC
+              </strong>.
             </p>
-            <div className="mt-2 flex flex-wrap gap-3 text-xs">
+
+            {/* Ejemplo visual */}
+            <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 mb-3">
+              <p className="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wide">
+                Ejemplo — Predicción: 19 °C
+              </p>
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                {/* Tokens */}
+                <div className="flex-1 min-w-[5rem] text-center px-2 py-2 rounded-lg border border-gray-600 text-gray-400 bg-gray-900">
+                  <p className="text-sm font-bold">18 °C</p>
+                  <p className="text-xs opacity-60 mt-0.5">pred − 1°</p>
+                </div>
+                <div className="flex-1 min-w-[5rem] text-center px-2 py-2 rounded-lg border border-yellow-700 text-yellow-300 bg-gray-900">
+                  <p className="text-sm font-bold">19 °C</p>
+                  <p className="text-xs opacity-60 mt-0.5">pred</p>
+                </div>
+                <div className="flex-1 min-w-[5rem] text-center px-2 py-2 rounded-lg border border-gray-600 text-gray-400 bg-gray-900">
+                  <p className="text-sm font-bold">20 °C</p>
+                  <p className="text-xs opacity-60 mt-0.5">pred + 1°</p>
+                </div>
+
+                {/* Flecha */}
+                <div className="text-gray-600 text-lg hidden sm:block">→</div>
+
+                {/* Resultado */}
+                <div className="flex-1 min-w-[7rem] text-center px-2 py-2 rounded-lg border border-green-800 bg-green-950/40">
+                  <p className="text-xs text-green-400 font-medium">Si resuelve 18, 19 ó 20</p>
+                  <p className="text-sm text-green-300 font-bold mt-0.5">N × 1 USDC ✓</p>
+                  <p className="text-xs text-gray-500 mt-0.5">los otros 2 → 0</p>
+                </div>
+              </div>
+
+              {/* Fórmula */}
+              <div className="mt-2 pt-2 border-t border-gray-800 grid grid-cols-1 sm:grid-cols-3 gap-1 text-xs text-gray-500">
+                <span>
+                  <strong className="text-gray-300">N</strong>{' '}
+                  = {budget} ÷ (p₁₈ + p₁₉ + p₂₀)
+                </span>
+                <span>
+                  <strong className="text-gray-300">Coste total</strong>{' '}
+                  = N × suma precios = {budget} USDC
+                </span>
+                <span>
+                  <strong className="text-green-400">Ganancia mín.</strong>{' '}
+                  = N × (1 − suma) {'>'} N × {(1 - budget).toFixed(2)}
+                </span>
+              </div>
+            </div>
+
+            {/* Criterio de validación + budget */}
+            <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
               <span className="text-gray-500">
-                🎯 Criterio de validación:{' '}
+                🎯 Criterio:{' '}
                 <strong className="text-white">≥ 90% hit rate en los últimos 90 días (OOS)</strong>
               </span>
               <span className="text-gray-500">
-                💰 Budget:{' '}
-                <strong className="text-white">{budget} USDC/día</strong>
+                💰 Budget diario seleccionable —{' '}
+                <strong className="text-white">
+                  suma unitaria debe ser &lt; {budget} USDC
+                </strong>
               </span>
             </div>
+
           </div>
         </div>
       </section>
@@ -143,12 +206,10 @@ export default async function ConfigPage() {
                 className="flex items-center justify-between text-xs py-1 border-b border-gray-800/50"
               >
                 <span className="text-gray-300">{entry.market_date}</span>
-                <span className="text-gray-500">
-                  {entry.token_count} tokens
-                </span>
+                <span className="text-gray-500">{entry.token_count} tokens</span>
                 <span className="text-gray-600">
                   {new Date(entry.fetched_at).toLocaleString('es-ES', {
-                    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+                    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
                   })}
                 </span>
               </div>
@@ -176,7 +237,7 @@ export default async function ConfigPage() {
                 <tr key={job.id} className="border-b border-gray-800/50">
                   <td className="py-2.5 pr-4 text-gray-400 text-xs">
                     {new Date(job.created_at).toLocaleString('es-ES', {
-                      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+                      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
                   <td className="py-2.5 pr-4 text-gray-400 text-xs">
