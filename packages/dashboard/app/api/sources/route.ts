@@ -42,6 +42,7 @@ export async function PATCH(req: NextRequest) {
               .from('weather_sources')
               .update({ active: source.active, updated_at: new Date().toISOString() })
               .eq('slug', source.slug)
+              .then()
           )
         }
         if (source.slug && typeof source.weight === 'number') {
@@ -50,6 +51,7 @@ export async function PATCH(req: NextRequest) {
               .from('weather_sources')
               .update({ weight: source.weight, updated_at: new Date().toISOString() })
               .eq('slug', source.slug)
+              .then()
           )
         }
       }
@@ -63,6 +65,7 @@ export async function PATCH(req: NextRequest) {
             .from('bot_config')
             .update({ value, updated_at: new Date().toISOString() })
             .eq('key', key)
+            .then()
         )
       }
 
@@ -76,6 +79,7 @@ export async function PATCH(req: NextRequest) {
               value: body.activeSources,
               description: 'Fuentes activas para el ensemble',
             })
+            .then()
         )
       }
     }
