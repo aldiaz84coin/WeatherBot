@@ -1,4 +1,4 @@
-// app/layout.tsx
+// app/layout.tsx — ACTUALIZADO con enlace a /config
 import type { Metadata } from 'next'
 import './globals.css'
 
@@ -16,6 +16,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <a href="/" className="text-sm text-gray-400 hover:text-white transition-colors">Overview</a>
           <a href="/predictions" className="text-sm text-gray-400 hover:text-white transition-colors">Predicciones</a>
           <a href="/training" className="text-sm text-gray-400 hover:text-white transition-colors">Entrenamiento</a>
+          <a href="/config" className="text-sm text-gray-400 hover:text-white transition-colors">
+            ⚙️ Configuración
+          </a>
         </nav>
         <main className="max-w-6xl mx-auto px-6 py-8">
           {children}

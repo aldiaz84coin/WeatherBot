@@ -1,16 +1,17 @@
-// src/scheduler.ts
-// Cron diario — se ejecuta a las 18:00 hora de Madrid
-// En Railway, usar TZ=Europe/Madrid en las variables de entorno
+// src/scheduler.ts — ACTUALIZADO
+// Incluye el job runner para procesar backtests pedidos desde el dashboard.
 
 import 'dotenv/config'
 import cron from 'node-cron'
 import { runDailyPrediction } from './prediction/predict'
+import { startJobRunner } from './jobs/job-runner'
 
 console.log('🤖 Madrid Temp Bot iniciado')
 console.log(`   Modo: ${process.env.LIVE_TRADING === 'true' ? '🔴 LIVE' : '🟡 SIMULACIÓN'}`)
-console.log('   Predicción diaria: 18:00 Europe/Madrid\n')
+console.log('   Predicción diaria: 18:00 Europe/Madrid')
+console.log('   Job runner: activo (backtest jobs cada 30s)\n')
 
-// Cada día a las 18:00 (hora de Madrid, TZ configurado en Railway)
+// ── Predicción diaria a las 18:00 ────────────────────────────────────────────
 cron.schedule('0 18 * * *', async () => {
   console.log(`\n[${new Date().toISOString()}] 🔔 Ejecutando predicción diaria...`)
   try {
@@ -23,7 +24,10 @@ cron.schedule('0 18 * * *', async () => {
   timezone: 'Europe/Madrid',
 })
 
-// Mantener el proceso vivo
+// ── Job runner: procesar backtests pedidos desde el dashboard ────────────────
+startJobRunner(30_000) // Comprobar cada 30 segundos
+
+// ── Mantener proceso vivo ─────────────────────────────────────────────────────
 process.on('SIGTERM', () => {
   console.log('Bot detenido.')
   process.exit(0)
