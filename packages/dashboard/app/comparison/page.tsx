@@ -136,9 +136,9 @@ export default function ComparisonPage() {
       })
       .catch(() => {})
 
-    // Estadísticas históricas
+    // Estadísticas históricas — cargar siempre al montar
     loadHistoricalStats()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loadHistoricalStats])
 
   const loadHistoricalStats = useCallback(async () => {
     setHistoricalLoading(true)
@@ -179,11 +179,12 @@ export default function ComparisonPage() {
       setKeysConfigured(json.keysConfigured)
       setTomorrowSources(json.tomorrowSources ?? null)
 
-      // Mostrar cuántos registros se guardaron y refrescar stats históricas
-      if (json.historicalSaved && json.historicalSaved > 0) {
+      // Mostrar cuántos registros se guardaron
+      if (json.historicalSaved !== undefined && json.historicalSaved > 0) {
         setLastSaved(json.historicalSaved)
-        await loadHistoricalStats()
       }
+      // Refrescar stats históricas siempre (aunque no haya nuevos registros)
+      await loadHistoricalStats()
       setProgress('')
     } catch (e: any) {
       setError(e.message ?? 'Error desconocido'); setProgress('')
