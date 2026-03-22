@@ -70,8 +70,10 @@ function priceColor(price: number): string {
 function TokenRow({ token, isTop, maxPrice }: { token: Token; isTop: boolean; maxPrice: number }) {
   const barPct = maxPrice > 0 ? ((token.price / maxPrice) * 100).toFixed(1) : '0'
   const barColor =
-    token.tempC >= 30 ? 'bg-gradient-to-r from-amber-500 to-red-500'
-    : token.tempC >= 22 ? 'bg-gradient-to-r from-emerald-500 to-blue-500'
+     token.tempCelsius >= 30 ? 'bg-gradient-to-r from-amber-500 to-red-500'
+   : token.tempCelsius >= 22 ? 'bg-gradient-to-r from-emerald-500 to-blue-500'
+    //token.tempC >= 30 ? 'bg-gradient-to-r from-amber-500 to-red-500'
+    //: token.tempC >= 22 ? 'bg-gradient-to-r from-emerald-500 to-blue-500'
     : 'bg-blue-600'
 
   return (
