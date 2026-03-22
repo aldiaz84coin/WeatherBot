@@ -1,7 +1,11 @@
 // app/api/markets/route.ts
 // Devuelve los tokens de Polymarket para una fecha específica.
-// Intenta primero desde el cache de Supabase, luego hace fetch real.
-// Usado por PolymarketSimPanel y MarketDataPanel del dashboard.
+// Estructura real de la Gamma API (descubierta 2026-03-22):
+//   - El endpoint /events?slug=<daySlug> devuelve todos los sub-mercados en events[0].markets
+//   - Cada market NO tiene campo "tokens"; el precio YES está en outcomePrices[0] (string JSON)
+//   - El tokenId YES está en clobTokenIds[0] (string JSON)
+//   - Slugs de temperatura: ...-14corbelow | ...-15c | ... | ...-23c | ...-24corhigher
+//   - La temperatura se lee también de groupItemTitle: "14°C or below" / "18°C" / "24°C or higher"
 
 import { createClient } from '@supabase/supabase-js'
 import { NextRequest, NextResponse } from 'next/server'
@@ -21,7 +25,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Fecha inválida (usa YYYY-MM-DD)' }, { status: 400 })
   }
 
-  // 1. Intentar desde cache — SOLO si tiene tokens (no cachear fallos)
+  // ── 1. Caché de Supabase ──────────────────────────────────────────────────
   const { data: cached } = await supabase
     .from('market_data_cache')
     .select('payload, fetched_at')
@@ -30,88 +34,59 @@ export async function GET(req: NextRequest) {
 
   if (cached?.payload) {
     const payload = cached.payload as any
-    // BUG FIX 3: Solo usar cache si tiene datos reales (tokens.length > 0)
-    // Si fue cacheado con available:false por un fallo de red, reintentamos.
-    const ageMs = Date.now() - new Date(cached.fetched_at).getTime()
-    const isResolved = payload.resolvedTemp !== null && payload.resolvedTemp !== undefined
     const hasTokens  = Array.isArray(payload.tokens) && payload.tokens.length > 0
+    const isResolved = payload.resolvedTemp !== null && payload.resolvedTemp !== undefined
+    const ageMs      = Date.now() - new Date(cached.fetched_at).getTime()
 
-    if (hasTokens || isResolved) {
-      // Cache válido: tiene datos o ya está resuelto (no cambiará)
+    // Cache válido si: tiene tokens, o ya está resuelto, o tiene menos de 30 min
+    if (hasTokens || isResolved || ageMs < 30 * 60 * 1000) {
       return NextResponse.json({ ...payload, fromCache: true })
     }
-    // Cache vacío y antiguo de más de 30 min → reintentar fetch
-    if (ageMs < 30 * 60 * 1000) {
-      return NextResponse.json({ ...payload, fromCache: true })
-    }
-    // Si tiene más de 30 min sin datos → caído cache, reintentamos
   }
 
-  // 2. Fetch desde Polymarket Gamma API
+  // ── 2. Fetch desde Gamma API ──────────────────────────────────────────────
   try {
     const dateForSlug = formatDateForSlug(date)
     const daySlug     = `highest-temperature-in-madrid-on-${dateForSlug}`
 
-    let markets: any[] = []
-
-    // ── Intento 1: /events (un solo request devuelve todos los sub-mercados) ──
-    try {
-      const eventsRes = await fetch(
-        `${GAMMA_BASE}/events?slug=${encodeURIComponent(daySlug)}`,
-        { signal: AbortSignal.timeout(10_000) }
-      )
-      if (eventsRes.ok) {
-        const events = await eventsRes.json()
-        if (Array.isArray(events) && events.length > 0) {
-          markets = events[0].markets || []
-        }
-      }
-    } catch (e) {
-      console.warn('[/api/markets] /events falló:', e)
-    }
-
-    // ── Intento 2: /markets?slug=<daySlug> (a veces el event slug == market slug) ──
-    if (markets.length === 0) {
-      try {
-        const mRes = await fetch(
-          `${GAMMA_BASE}/markets?slug=${encodeURIComponent(daySlug)}&limit=1`,
-          { signal: AbortSignal.timeout(8_000) }
-        )
-        if (mRes.ok) {
-          const mData = await mRes.json()
-          if (Array.isArray(mData) && mData.length > 0) {
-            markets = mData
-          }
-        }
-      } catch (e) {
-        console.warn('[/api/markets] /markets?slug= falló:', e)
-      }
-    }
-
-    // ── BUG FIX 2: Fallback por slugs individuales de temperatura ──
-    // El parámetro slug_contains NO existe en Gamma API.
-    // En su lugar probamos slugs individuales para cada °C del rango verosímil.
-    if (markets.length === 0) {
-      markets = await fetchViaIndividualSlugs(dateForSlug)
-    }
-
-    const tokens      = parseTokens(markets)
-    const resolvedTemp = tokens.find(t => t.resolvedYes)?.tempCelsius ?? null
-    const totalPriceSum = parseFloat(
-      tokens.reduce((sum, t) => sum + t.price, 0).toFixed(4)
+    // El endpoint /events devuelve el evento con TODOS los sub-mercados incluidos
+    const eventsRes = await fetch(
+      `${GAMMA_BASE}/events?slug=${encodeURIComponent(daySlug)}`,
+      { signal: AbortSignal.timeout(12_000) }
     )
+
+    if (!eventsRes.ok) {
+      throw new Error(`Gamma API respondió ${eventsRes.status}`)
+    }
+
+    const events = await eventsRes.json()
+
+    if (!Array.isArray(events) || events.length === 0) {
+      // Mercado aún no creado (fecha futura lejana)
+      return NextResponse.json({
+        date, available: false, tokens: [],
+        resolvedTemp: null, totalPriceSum: 0,
+        fetchedAt: new Date().toISOString(), fromCache: false,
+      })
+    }
+
+    const markets: any[] = events[0].markets ?? []
+    const tokens = parseTokens(markets)
+
+    const resolvedTemp  = tokens.find(t => t.resolvedYes)?.tempCelsius ?? null
+    const totalPriceSum = parseFloat(tokens.reduce((s, t) => s + t.price, 0).toFixed(4))
 
     const result = {
       date,
-      available:      tokens.length > 0,
+      available: tokens.length > 0,
       tokens,
       resolvedTemp,
       totalPriceSum,
-      fetchedAt:      new Date().toISOString(),
-      fromCache:      false,
+      fetchedAt:  new Date().toISOString(),
+      fromCache:  false,
     }
 
-    // Cachear solo si tiene datos
+    // Cachear si tiene datos (o si ya está resuelto para no re-fetchear)
     if (tokens.length > 0) {
       await supabase.from('market_data_cache').upsert(
         { market_date: date, payload: result, fetched_at: result.fetchedAt },
@@ -122,7 +97,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(result)
 
   } catch (err) {
-    console.error('[/api/markets] Error inesperado:', err)
+    console.error('[/api/markets] Error:', err)
     return NextResponse.json(
       { error: 'Error conectando con Polymarket' },
       { status: 502 }
@@ -130,100 +105,89 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// ─── Fallback: slugs individuales por temperatura ────────────────────────────
-// Rango de temperaturas razonables para Madrid
-const TEMP_MIN = 5
-const TEMP_MAX = 43
-const BATCH_SIZE = 10
-
-async function fetchViaIndividualSlugs(dateForSlug: string): Promise<any[]> {
-  const temps = Array.from(
-    { length: TEMP_MAX - TEMP_MIN + 1 },
-    (_, i) => i + TEMP_MIN
-  )
-
-  const found: any[] = []
-
-  for (let i = 0; i < temps.length; i += BATCH_SIZE) {
-    const batch = temps.slice(i, i + BATCH_SIZE)
-    const results = await Promise.allSettled(
-      batch.map(async (temp) => {
-        const slug = `highest-temperature-in-madrid-${temp}c-on-${dateForSlug}`
-        const res = await fetch(
-          `${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`,
-          { signal: AbortSignal.timeout(7_000) }
-        )
-        if (!res.ok) return null
-        const data = await res.json()
-        return Array.isArray(data) && data.length > 0 ? data[0] : null
-      })
-    )
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value) found.push(r.value)
-    }
-    // Pequeña pausa entre batches para no saturar la API
-    if (i + BATCH_SIZE < temps.length) {
-      await new Promise(r => setTimeout(r, 200))
-    }
-  }
-
-  return found
-}
-
-// ─── parseTokens ─────────────────────────────────────────────────────────────
+// ─── parseTokens ──────────────────────────────────────────────────────────────
+// Convierte los markets del evento en tokens normalizados.
+//
+// Estructura real del market:
+//   slug:          "...-18c"  |  "...-14corbelow"  |  "...-24corhigher"
+//   groupItemTitle: "18°C"    |  "14°C or below"   |  "24°C or higher"
+//   outcomePrices: "[\"0.39\", \"0.61\"]"   (string JSON, índice 0 = YES)
+//   clobTokenIds:  "[\"<id_yes>\", \"<id_no>\"]" (string JSON)
+//   closed:        true/false
+//   resolvedPrice: "1" | "0" | undefined  (solo cuando closed=true)
 
 function parseTokens(markets: any[]) {
   const tokens: {
-    tempCelsius:  number
-    price:        number
-    resolvedYes:  boolean
-    resolved:     boolean
-    slug:         string
-    tokenId:      string
+    tempCelsius:    number
+    label:          string   // "14°C or below" | "18°C" | "24°C or higher"
+    price:          number   // probabilidad YES (0.0 – 1.0)
+    tokenId:        string
+    resolved:       boolean
+    resolvedYes:    boolean
+    slug:           string
   }[] = []
 
-  for (const market of markets) {
-    // Extraer temperatura del slug: highest-temperature-in-madrid-Xc-on-...
-    const tempMatch = (market.slug || '').match(/-(\d+)c-on-/)
-    if (!tempMatch) continue
-    const tempCelsius = parseInt(tempMatch[1])
+  for (const m of markets) {
+    // ── Temperatura ────────────────────────────────────────────────────────
+    // Primero intentar desde groupItemTitle: "14°C or below" / "18°C" / "24°C or higher"
+    let tempCelsius: number | null = null
+    const label: string = m.groupItemTitle ?? ''
 
-    // BUG FIX 1: La Gamma API a veces devuelve tokens como STRING JSON, no array
-    let tokenList: any[] = []
-    try {
-      tokenList = typeof market.tokens === 'string'
-        ? JSON.parse(market.tokens)
-        : (Array.isArray(market.tokens) ? market.tokens : [])
-    } catch {
-      tokenList = []
+    const titleMatch = label.match(/^(\d+)/)
+    if (titleMatch) {
+      tempCelsius = parseInt(titleMatch[1])
     }
 
-    const yesToken = tokenList.find((t: any) =>
-      (t.outcome || '').toLowerCase() === 'yes'
-    )
-    if (!yesToken) continue
+    // Fallback: extraer del slug: ...-18c, ...-14corbelow, ...-24corhigher
+    if (tempCelsius === null) {
+      const slugMatch = (m.slug ?? '').match(/-(\d+)c(?:orbelow|orhigher)?$/)
+      if (slugMatch) tempCelsius = parseInt(slugMatch[1])
+    }
 
-    const price = parseFloat(yesToken.price ?? '0')
-    if (isNaN(price)) continue
+    if (tempCelsius === null) continue
 
-    const resolved    = market.closed === true || market.resolved === true
-    const resolvedYes = resolved && parseFloat(market.resolvedPrice ?? 'NaN') === 1
+    // ── Precio YES ─────────────────────────────────────────────────────────
+    // outcomePrices es un string JSON: "[\"0.39\", \"0.61\"]"
+    // índice 0 = YES, índice 1 = NO
+    let price = 0
+    try {
+      const prices = typeof m.outcomePrices === 'string'
+        ? JSON.parse(m.outcomePrices)
+        : m.outcomePrices
+      price = parseFloat(prices?.[0] ?? '0')
+      if (isNaN(price)) price = 0
+    } catch { price = 0 }
+
+    // ── Token ID ───────────────────────────────────────────────────────────
+    // clobTokenIds es un string JSON: "[\"<yes_id>\", \"<no_id>\"]"
+    let tokenId = ''
+    try {
+      const ids = typeof m.clobTokenIds === 'string'
+        ? JSON.parse(m.clobTokenIds)
+        : m.clobTokenIds
+      tokenId = ids?.[0] ?? ''
+    } catch { tokenId = '' }
+
+    // ── Resolución ─────────────────────────────────────────────────────────
+    const resolved    = m.closed === true
+    const resolvedYes = resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1
 
     tokens.push({
       tempCelsius,
+      label:       label || `${tempCelsius}°C`,
       price,
-      resolvedYes,
+      tokenId,
       resolved,
-      slug:    market.slug,
-      tokenId: yesToken.tokenId || yesToken.token_id || '',
+      resolvedYes,
+      slug: m.slug ?? '',
     })
   }
 
   return tokens.sort((a, b) => a.tempCelsius - b.tempCelsius)
 }
 
-// ─── formatDateForSlug ───────────────────────────────────────────────────────
-// "2026-03-23" → "march-23-2026"
+// ─── formatDateForSlug ────────────────────────────────────────────────────────
+// "2026-03-22" → "march-22-2026"
 
 function formatDateForSlug(date: string): string {
   const d = new Date(date + 'T12:00:00')
