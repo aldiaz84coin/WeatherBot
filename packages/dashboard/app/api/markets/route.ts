@@ -169,15 +169,23 @@ function parseTokens(markets: any[]) {
     } catch { tokenId = '' }
 
     // ── Resolución ─────────────────────────────────────────────────────────
+    // Un mercado puede estar "en revisión": closed=false pero ya tiene ganador.
+    // Detectamos el ganador por tres vías (cualquiera es suficiente):
+    //   1. closed=true + resolvedPrice="1"  → resolución oficial
+    //   2. price >= 0.99                    → en revisión, prácticamente resuelto
+    //   3. lastTradePrice >= 0.99           → último precio negociado casi 1
     const resolved    = m.closed === true
-    const resolvedYes = resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1
+    const resolvedYes =
+      (resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1) ||
+      price >= 0.99 ||
+      parseFloat(m.lastTradePrice ?? '0') >= 0.99
 
     tokens.push({
       tempCelsius,
       label:       label || `${tempCelsius}°C`,
       price,
       tokenId,
-      resolved,
+      resolved:    resolved || resolvedYes,   // en revisión también cuenta como resuelto
       resolvedYes,
       slug: m.slug ?? '',
     })
