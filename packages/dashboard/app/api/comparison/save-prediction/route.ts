@@ -15,6 +15,12 @@
 //   sourceTemps   Record<string, number>      snapshot de cada fuente
 //   targetDate    string                      YYYY-MM-DD (mañana)
 //   stake         number                      stake total en USD (default 20)
+//
+// Lógica de reparto de stake:
+//   Se compra el MISMO número de shares (N) para token_a y token_b.
+//   N = stake / (priceA + priceB)
+//   costA = N * priceA  |  costB = N * priceB
+//   Si algún precio es desconocido → reparto 50/50 por coste.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
@@ -73,76 +79,90 @@ async function getTokenPrice(slug: string): Promise<number | null> {
   }
 }
 
-// ─── Handler ──────────────────────────────────────────────────────────────────
+// ─── Reparto de stake por igual número de shares ──────────────────────────────
+//
+// Objetivo: comprar exactamente N shares de cada token, donde:
+//   N = stake / (priceA + priceB)
+//   costA = N * priceA  (proporción al precio)
+//   costB = N * priceB
+//
+// Si algún precio es null → reparto 50/50 por coste (fallback).
+
+interface StakeAllocation {
+  shares:  number        // número de tokens comprados de cada posición
+  costA:   number        // USD gastados en token A
+  costB:   number        // USD gastados en token B
+}
+
+function allocateStake(
+  stake:  number,
+  priceA: number | null,
+  priceB: number | null,
+): StakeAllocation {
+  if (priceA && priceA > 0 && priceB && priceB > 0) {
+    // Mismo número de shares para ambos tokens
+    const N     = parseFloat((stake / (priceA + priceB)).toFixed(4))
+    const costA = parseFloat((N * priceA).toFixed(4))
+    const costB = parseFloat((N * priceB).toFixed(4))
+    return { shares: N, costA, costB }
+  }
+  // Fallback: reparto igualado por coste
+  const half = parseFloat((stake / 2).toFixed(4))
+  return {
+    shares: priceA && priceA > 0 ? parseFloat((half / priceA).toFixed(4)) : 0,
+    costA:  half,
+    costB:  half,
+  }
+}
+
+// ─── Handler principal ────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-
     const {
-      weights,        // pesos actualmente en los sliders
-      optWeights,     // pesos óptimos calculados por MAE (pueden ser null)
-      ensembleTemp,   // temperatura predicha (decimal)
-      sourceTemps,    // { aemet: 32.1, open_meteo: 31.8, ... }
-      targetDate,     // YYYY-MM-DD (mañana)
-      stake = 20,     // stake total en USD
-    } = body as {
-      weights:      Record<string, number>
-      optWeights:   Record<string, number> | null
-      ensembleTemp: number
-      sourceTemps:  Record<string, number>
-      targetDate:   string
-      stake:        number
+      weights,
+      optWeights,
+      ensembleTemp,
+      sourceTemps,
+      targetDate,
+      stake = 20,
+    } = body
+
+    if (!weights || !ensembleTemp || !targetDate) {
+      return NextResponse.json({ error: 'Faltan parámetros obligatorios' }, { status: 400 })
     }
 
-    if (!weights || ensembleTemp == null || !targetDate) {
-      return NextResponse.json(
-        { error: 'Faltan campos: weights, ensembleTemp, targetDate' },
-        { status: 400 }
-      )
-    }
-
-    // ── 1. Guardar pesos optimizados en weather_sources ───────────────────────
-    //    Usamos optWeights si existen; si no, los pesos actuales del slider.
-    const weightsToSave = optWeights ?? weights
-
-    const weightUpdates = Object.entries(weightsToSave).map(([key, weight]) => {
-      const dbSlug = SLUG_MAP[key] ?? key
-      return supabase
-        .from('weather_sources')
-        .update({
-          weight:     weight,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('slug', dbSlug)
-    })
-    await Promise.allSettled(weightUpdates)
-
-    // ── 2. Calcular tokens (ceil y ceil+1) ────────────────────────────────────
-    const ceilTemp  = Math.ceil(ensembleTemp)
-    const tokenATemp = ceilTemp
-    const tokenBTemp = ceilTemp + 1
+    // ── 1. Calcular tokens ────────────────────────────────────────────────────
+    const tokenATemp = Math.ceil(ensembleTemp)
+    const tokenBTemp = tokenATemp + 1
     const tokenASlug = buildTokenSlug(targetDate, tokenATemp)
     const tokenBSlug = buildTokenSlug(targetDate, tokenBTemp)
 
-    // ── 3. Precios actuales de Polymarket ─────────────────────────────────────
+    // ── 2. Precios Polymarket ─────────────────────────────────────────────────
     const [priceA, priceB] = await Promise.all([
       getTokenPrice(tokenASlug),
       getTokenPrice(tokenBSlug),
     ])
 
-    const costPerToken = parseFloat((stake / 2).toFixed(4))
+    // ── 3. Reparto de stake: mismo número de shares ───────────────────────────
+    const { shares, costA, costB } = allocateStake(stake, priceA, priceB)
 
-    const sharesA = priceA && priceA > 0
-      ? parseFloat((costPerToken / priceA).toFixed(4))
-      : null
-    const sharesB = priceB && priceB > 0
-      ? parseFloat((costPerToken / priceB).toFixed(4))
-      : null
+    const sharesA = priceA && priceA > 0 ? shares : null
+    const sharesB = priceB && priceB > 0 ? shares : null
 
-    // ── 4. Upsert predicción ──────────────────────────────────────────────────
-    //    Si ya existe una predicción comparison_source=true para targetDate,
-    //    la actualizamos (re-calcula con los pesos más recientes).
+    // ── 4. Persistir pesos en weather_sources ─────────────────────────────────
+    const weightsToSave = optWeights ?? weights
+    const weightUpdates = Object.entries(weightsToSave).map(([key, weight]) => {
+      const slug = SLUG_MAP[key] ?? key
+      return supabase
+        .from('weather_sources')
+        .update({ weight: weight as number, updated_at: new Date().toISOString() })
+        .eq('slug', slug)
+    })
+    await Promise.allSettled(weightUpdates)
+
+    // ── 5. Upsert predicción ──────────────────────────────────────────────────
     const { data: existing } = await supabase
       .from('predictions')
       .select('id')
@@ -160,13 +180,13 @@ export async function POST(req: NextRequest) {
       // Tokens (2-token model)
       token_a:           tokenATemp,
       token_b:           tokenBTemp,
-      cost_a_usdc:       costPerToken,
-      cost_b_usdc:       costPerToken,
+      cost_a_usdc:       costA,
+      cost_b_usdc:       costB,
       stake_usdc:        stake,
       comparison_source: true,
       simulated:         true,
       settled:           false,
-      // Columnas legacy (null en modelo nuevo)
+      // Columnas legacy → null en modelo nuevo
       token_low:         null,
       token_mid:         null,
       token_high:        null,
@@ -196,7 +216,7 @@ export async function POST(req: NextRequest) {
       prediction = data
     }
 
-    // ── 5. Reemplazar trades (eliminar previos + insertar nuevos) ─────────────
+    // ── 6. Reemplazar trades ──────────────────────────────────────────────────
     await supabase
       .from('trades')
       .delete()
@@ -208,7 +228,7 @@ export async function POST(req: NextRequest) {
         slug:          tokenASlug,
         token_temp:    tokenATemp,
         position:      'a',
-        cost_usdc:     costPerToken,
+        cost_usdc:     costA,
         price_at_buy:  priceA,
         shares:        sharesA,
         simulated:     true,
@@ -219,7 +239,7 @@ export async function POST(req: NextRequest) {
         slug:          tokenBSlug,
         token_temp:    tokenBTemp,
         position:      'b',
-        cost_usdc:     costPerToken,
+        cost_usdc:     costB,
         price_at_buy:  priceB,
         shares:        sharesB,
         simulated:     true,
@@ -234,7 +254,7 @@ export async function POST(req: NextRequest) {
 
     if (tradesError) throw tradesError
 
-    // ── 6. Respuesta completa ─────────────────────────────────────────────────
+    // ── 7. Respuesta completa ─────────────────────────────────────────────────
     return NextResponse.json({
       ok: true,
       prediction,
@@ -244,14 +264,14 @@ export async function POST(req: NextRequest) {
         slug:   tokenASlug,
         price:  priceA,
         shares: sharesA,
-        cost:   costPerToken,
+        cost:   costA,
       },
       tokenB: {
         temp:   tokenBTemp,
         slug:   tokenBSlug,
         price:  priceB,
         shares: sharesB,
-        cost:   costPerToken,
+        cost:   costB,
       },
       weightsApplied: weightsToSave,
       isUpdate: !!existing?.id,
