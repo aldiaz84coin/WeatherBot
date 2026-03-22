@@ -41,9 +41,23 @@ export interface DayRow {
   }
 }
 
+export interface TomorrowSources {
+  date: string   // fecha de mañana (YYYY-MM-DD)
+  sources: {
+    aemet: SourceResult
+    openweather: SourceResult
+    tomorrow: SourceResult
+    visual_crossing: SourceResult
+    weatherapi: SourceResult
+    accuweather: SourceResult
+    open_meteo: SourceResult
+  }
+}
+
 export interface ComparisonResponse {
   rows: DayRow[]
   keysConfigured: Record<string, boolean>
+  tomorrowSources?: TomorrowSources
 }
 
 // ─── Helpers de slug / fecha ──────────────────────────────────────────────────
@@ -67,7 +81,17 @@ function getLast8Days(): string[] {
   return days
 }
 
+function getTomorrowDate(): string {
+  const d = new Date()
+  d.setDate(d.getDate() + 1)
+  return d.toISOString().split('T')[0]
+}
+
 // ─── Polymarket ───────────────────────────────────────────────────────────────
+// FIX: antes usaba m.tokens (no existe en /events de Gamma).
+// Ahora parsea m.outcomePrices (string JSON) igual que markets/route.ts,
+// usa groupItemTitle para extraer temperatura y detecta resolución por
+// resolvedPrice, price >= 0.99 o lastTradePrice >= 0.99.
 
 async function fetchPolymarket(date: string): Promise<DayRow['polymarket']> {
   const slug = `highest-temperature-in-madrid-on-${toSlugDate(date)}`
@@ -86,22 +110,47 @@ async function fetchPolymarket(date: string): Promise<DayRow['polymarket']> {
     let resolvedTemp: number | null = null
 
     for (const m of markets) {
-      const match = (m.slug ?? '').match(/-(\d+)c-on-/)
-      if (!match) continue
-      const tempC = parseInt(match[1])
+      // ── Temperatura ──────────────────────────────────────────────────────
+      // 1. Primero intentar desde groupItemTitle: "14°C or below" / "18°C"
+      let tempC: number | null = null
+      const label: string = m.groupItemTitle ?? ''
+      const titleMatch = label.match(/^(\d+)/)
+      if (titleMatch) tempC = parseInt(titleMatch[1])
 
-      // ¿Resuelto?
-      if (parseFloat(m.resolvedPrice) === 1) {
+      // 2. Fallback: slug del market — soporta -Xc, -Xcorbelow, -Xcorhigher
+      if (tempC === null) {
+        const slugMatch = (m.slug ?? '').match(/-(\d+)c(?:orbelow|orhigher)?(?:-on-|$)/)
+        if (slugMatch) tempC = parseInt(slugMatch[1])
+      }
+      if (tempC === null) continue
+
+      // ── Precio YES ───────────────────────────────────────────────────────
+      // outcomePrices es un string JSON: "[\"0.39\", \"0.61\"]" (índice 0 = YES)
+      let price = 0
+      try {
+        const prices = typeof m.outcomePrices === 'string'
+          ? JSON.parse(m.outcomePrices)
+          : (m.outcomePrices ?? [])
+        price = parseFloat(prices?.[0] ?? '0')
+        if (isNaN(price)) price = 0
+      } catch { price = 0 }
+
+      // ── Resolución ────────────────────────────────────────────────────────
+      // Tres vías: closed+resolvedPrice=1, price≥0.99, lastTradePrice≥0.99
+      const resolved   = m.closed === true
+      const resolvedYes =
+        (resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1) ||
+        price >= 0.99 ||
+        parseFloat(m.lastTradePrice ?? '0') >= 0.99
+
+      if (resolvedYes) {
         resolvedTemp = tempC
-        break
+        // No hacemos break para permitir que otro token tenga resolvedPrice=1 explícito
+        // pero sí podemos salir si la resolución es oficial
+        if (resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1) break
       }
 
-      // Token YES con mayor precio = temperatura más probable
-      const tokens: any[] = m.tokens ?? []
-      const yes = tokens.find(t => (t.outcome ?? '').toLowerCase() === 'yes')
-      if (!yes) continue
-      const p = parseFloat(yes.price ?? 0)
-      if (p > maxPrice) { maxPrice = p; maxTemp = tempC }
+      if (price > maxPrice) { maxPrice = price; maxTemp = tempC }
     }
 
     const temp = resolvedTemp ?? maxTemp
@@ -116,7 +165,7 @@ async function fetchPolymarket(date: string): Promise<DayRow['polymarket']> {
   }
 }
 
-// ─── Open-Meteo (gratuita, sin key) ──────────────────────────────────────────
+// ─── Open-Meteo (gratuita, sin key) ── HISTÓRICO ──────────────────────────────
 
 async function fetchOpenMeteo(date: string): Promise<SourceResult> {
   try {
@@ -125,61 +174,81 @@ async function fetchOpenMeteo(date: string): Promise<SourceResult> {
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const d = await res.json()
     const tmax = d?.daily?.temperature_2m_max?.[0]
-    if (tmax == null) throw new Error('Sin datos de temperatura')
+    if (tmax == null) throw new Error('Sin datos')
     return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
-// ─── AEMET ────────────────────────────────────────────────────────────────────
+// ─── Open-Meteo FORECAST (gratuita, sin key) ─────────────────────────────────
+
+async function fetchOpenMeteoForecast(date: string): Promise<SourceResult> {
+  try {
+    // Pedimos 3 días de previsión para asegurarnos de cubrir mañana
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${MADRID_LAT}&longitude=${MADRID_LON}&daily=temperature_2m_max&timezone=Europe%2FMadrid&forecast_days=3`
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    const dates: string[] = d?.daily?.time ?? []
+    const tmaxArr: number[] = d?.daily?.temperature_2m_max ?? []
+    const idx = dates.indexOf(date)
+    if (idx === -1) throw new Error('Fecha no encontrada en forecast')
+    const tmax = tmaxArr[idx]
+    if (tmax == null) throw new Error('Sin datos')
+    return { tmax: Math.round(tmax * 10) / 10, err: null }
+  } catch (e: any) {
+    return { tmax: null, err: e.message?.substring(0, 60) }
+  }
+}
+
+// ─── AEMET ─────────────────────────────────────────────────────────────────────
 
 async function fetchAemet(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
   try {
-    // Estación 3195 = Madrid Retiro (referencia oficial)
-    const url = `https://opendata.aemet.es/opendata/api/valores/climatologicos/diarios/datos/fechaini/${date}T00:00:00UTC/fechafin/${date}T23:59:59UTC/estacion/3195?api_key=${key}`
-    const r1 = await fetch(url, {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!r1.ok) throw new Error(`AEMET auth HTTP ${r1.status}`)
-    const link = await r1.json()
-    if (!link?.datos) throw new Error('Sin link de datos en respuesta AEMET')
-
-    const r2 = await fetch(link.datos, { signal: AbortSignal.timeout(10_000) })
-    if (!r2.ok) throw new Error(`AEMET datos HTTP ${r2.status}`)
-    const data = await r2.json()
-
-    if (!Array.isArray(data) || !data[0]) throw new Error('Datos AEMET vacíos')
-    const raw = data[0].tmax
-    if (!raw) throw new Error('Campo tmax no disponible')
-    const tmax = parseFloat(String(raw).replace(',', '.'))
-    if (isNaN(tmax)) throw new Error(`tmax inválido: ${raw}`)
-    return { tmax: Math.round(tmax * 10) / 10, err: null }
+    // AEMET predicción diaria Madrid (código 28079)
+    const res1 = await fetch(
+      `https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/diaria/28079/?api_key=${key}`,
+      { signal: AbortSignal.timeout(10_000) }
+    )
+    if (!res1.ok) throw new Error(`HTTP ${res1.status}`)
+    const meta = await res1.json()
+    if (meta.estado !== 200) throw new Error(meta.descripcion ?? 'Error AEMET')
+    const res2 = await fetch(meta.datos, { signal: AbortSignal.timeout(10_000) })
+    if (!res2.ok) throw new Error(`HTTP ${res2.status}`)
+    const data = await res2.json()
+    const pred = data?.[0]?.prediccion?.dia ?? []
+    const day = pred.find((d: any) => d.fecha?.startsWith(date))
+    if (!day) throw new Error('Fecha no encontrada')
+    const tmax = parseFloat(day.temperatura?.maxima)
+    if (isNaN(tmax)) throw new Error('Sin tmax')
+    return { tmax, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
-// ─── OpenWeatherMap ───────────────────────────────────────────────────────────
+// ─── OpenWeather ──────────────────────────────────────────────────────────────
 
 async function fetchOpenWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
   try {
-    const dt = Math.floor(new Date(date + 'T12:00:00Z').getTime() / 1000)
-    const url = `https://api.openweathermap.org/data/3.0/onecall/timemachine?lat=${MADRID_LAT}&lon=${MADRID_LON}&dt=${dt}&appid=${key}&units=metric`
+    const url = `https://api.openweathermap.org/data/2.5/forecast/daily?q=${encodeURIComponent(MADRID_QUERY)}&cnt=5&units=metric&appid=${key}`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({})) as any
-      throw new Error(err?.message ?? `HTTP ${res.status}`)
-    }
-    const d = await res.json() as any
-    const hourlyTemps: number[] = (d.data ?? []).map((h: any) => h.temp).filter((v: any) => typeof v === 'number')
-    if (!hourlyTemps.length) throw new Error('Sin datos horarios')
-    return { tmax: Math.round(Math.max(...hourlyTemps) * 10) / 10, err: null }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    const list: any[] = d?.list ?? []
+    const target = list.find(item => {
+      const dt = new Date(item.dt * 1000).toISOString().split('T')[0]
+      return dt === date
+    })
+    if (!target) throw new Error('Fecha no encontrada')
+    const tmax = target?.temp?.max
+    if (tmax == null) throw new Error('Sin tmax')
+    return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
@@ -188,20 +257,18 @@ async function fetchOpenWeather(date: string, key: string): Promise<SourceResult
 async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
   try {
-    const url = `https://api.tomorrow.io/v4/timelines?location=${MADRID_LAT},${MADRID_LON}&fields=temperatureMax&timesteps=1d&startTime=${date}T00:00:00Z&endTime=${date}T23:59:59Z&units=metric&apikey=${key}`
+    const url = `https://api.tomorrow.io/v4/weather/forecast?location=${MADRID_LAT},${MADRID_LON}&timesteps=1d&apikey=${key}`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({})) as any
-      throw new Error(err?.message ?? `HTTP ${res.status}`)
-    }
-    const d = await res.json() as any
-    const intervals = d?.data?.timelines?.[0]?.intervals
-    if (!intervals?.length) throw new Error('Sin intervalos en respuesta')
-    const tmax = intervals[0]?.values?.temperatureMax
-    if (tmax == null) throw new Error('temperatureMax no disponible')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    const days: any[] = d?.timelines?.daily ?? []
+    const target = days.find(item => item.time?.startsWith(date))
+    if (!target) throw new Error('Fecha no encontrada')
+    const tmax = target?.values?.temperatureMax
+    if (tmax == null) throw new Error('Sin tmax')
     return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
@@ -210,15 +277,15 @@ async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
 async function fetchVisualCrossing(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
   try {
-    const url = `https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/${encodeURIComponent(MADRID_QUERY)}/${date}/${date}?unitGroup=metric&include=days&key=${key}&contentType=json`
+    const url = `https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/${encodeURIComponent(MADRID_QUERY)}/${date}?unitGroup=metric&elements=tempmax&include=days&key=${key}&contentType=json`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const d = await res.json() as any
+    const d = await res.json()
     const tmax = d?.days?.[0]?.tempmax
-    if (tmax == null) throw new Error('tempmax no disponible')
+    if (tmax == null) throw new Error('Sin tmax')
     return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
@@ -227,76 +294,73 @@ async function fetchVisualCrossing(date: string, key: string): Promise<SourceRes
 async function fetchWeatherApi(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
   try {
-    const url = `https://api.weatherapi.com/v1/history.json?key=${key}&q=Madrid&dt=${date}`
+    const url = `https://api.weatherapi.com/v1/history.json?key=${key}&q=${encodeURIComponent(MADRID_QUERY)}&dt=${date}`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({})) as any
-      throw new Error(err?.error?.message ?? `HTTP ${res.status}`)
-    }
-    const d = await res.json() as any
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
     const tmax = d?.forecast?.forecastday?.[0]?.day?.maxtemp_c
-    if (tmax == null) throw new Error('maxtemp_c no disponible')
+    if (tmax == null) throw new Error('Sin tmax')
     return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
+  }
+}
+
+// ─── WeatherAPI FORECAST ──────────────────────────────────────────────────────
+
+async function fetchWeatherApiForecast(date: string, key: string): Promise<SourceResult> {
+  if (!key) return { tmax: null, err: 'Sin API key' }
+  try {
+    const url = `https://api.weatherapi.com/v1/forecast.json?key=${key}&q=${encodeURIComponent(MADRID_QUERY)}&dt=${date}&days=1`
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    const tmax = d?.forecast?.forecastday?.[0]?.day?.maxtemp_c
+    if (tmax == null) throw new Error('Sin tmax')
+    return { tmax: Math.round(tmax * 10) / 10, err: null }
+  } catch (e: any) {
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
 // ─── AccuWeather ──────────────────────────────────────────────────────────────
-// Histórico no disponible en plan gratuito, pero incluimos la fuente para
-// mostrar forecast de los próximos días cuando el dashboard lo necesite.
 
 async function fetchAccuWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
-  // Comprobamos si la fecha está en el rango del forecast gratuito (5 días)
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const target = new Date(date + 'T00:00:00')
-  const diffDays = Math.round((target.getTime() - today.getTime()) / 86_400_000)
-
-  if (diffDays < -1) {
-    return { tmax: null, err: 'Histórico no disponible en plan gratuito' }
-  }
   try {
-    const url = `https://dataservice.accuweather.com/forecasts/v1/daily/5day/${ACCUWEATHER_LOCATION_KEY}?apikey=${key}&metric=true`
+    const url = `https://dataservice.accuweather.com/forecasts/v1/daily/5day/${ACCUWEATHER_LOCATION_KEY}?apikey=${key}&metric=true&details=false`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({})) as any
-      throw new Error(err?.Message ?? `HTTP ${res.status}`)
-    }
-    const d = await res.json() as any
-    const day = (d?.DailyForecasts ?? []).find((f: any) =>
-      new Date(f.Date).toISOString().startsWith(date)
-    )
-    if (!day) throw new Error('Fecha no en ventana de forecast')
-    const tmax = day?.Temperature?.Maximum?.Value
-    if (tmax == null) throw new Error('Temperature.Maximum.Value no disponible')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const d = await res.json()
+    const days: any[] = d?.DailyForecasts ?? []
+    const target = days.find(day => {
+      const dt = new Date(day.Date).toISOString().split('T')[0]
+      return dt === date
+    })
+    if (!target) throw new Error('Fecha no encontrada')
+    const tmax = target?.Temperature?.Maximum?.Value
+    if (tmax == null) throw new Error('Sin tmax')
     return { tmax: Math.round(tmax * 10) / 10, err: null }
   } catch (e: any) {
-    return { tmax: null, err: e.message?.substring(0, 80) }
+    return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
-// ─── Handler principal ────────────────────────────────────────────────────────
+// ─── Handler ──────────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({})) as {
-      dates?: string[]
-      keyOverrides?: Record<string, string>
-    }
+    const body = await req.json().catch(() => ({}))
+    const dates: string[] = body.dates ?? getLast8Days()
+    const keyOverrides: Record<string, string> = body.keyOverrides ?? {}
 
-    const dates = body.dates ?? getLast8Days()
-    const overrides = body.keyOverrides ?? {}
-
-    // Resolver keys: override > env var
     const keys = {
-      aemet:          overrides.aemet          ?? process.env.AEMET_API_KEY          ?? '',
-      openweather:    overrides.openweather    ?? process.env.OPENWEATHER_API_KEY    ?? '',
-      tomorrow:       overrides.tomorrow       ?? process.env.TOMORROW_IO_KEY        ?? '',
-      visual_crossing: overrides.visual_crossing ?? process.env.VISUAL_CROSSING_KEY ?? '',
-      weatherapi:     overrides.weatherapi     ?? process.env.WEATHERAPI_KEY         ?? '',
-      accuweather:    overrides.accuweather    ?? process.env.ACCUWEATHER_API_KEY    ?? '',
+      aemet:          keyOverrides.aemet           ?? process.env.AEMET_API_KEY          ?? '',
+      openweather:    keyOverrides.openweather      ?? process.env.OPENWEATHER_API_KEY    ?? '',
+      tomorrow:       keyOverrides.tomorrow         ?? process.env.TOMORROW_IO_KEY        ?? '',
+      visual_crossing: keyOverrides.visual_crossing ?? process.env.VISUAL_CROSSING_KEY   ?? '',
+      weatherapi:     keyOverrides.weatherapi       ?? process.env.WEATHERAPI_KEY         ?? '',
+      accuweather:    keyOverrides.accuweather      ?? process.env.ACCUWEATHER_API_KEY    ?? '',
     }
 
     // Informar al cliente qué keys están configuradas (sin exponer los valores)
@@ -304,7 +368,7 @@ export async function POST(req: NextRequest) {
       Object.entries(keys).map(([k, v]) => [k, v.length > 0])
     )
 
-    // Fetch en paralelo por fecha
+    // Fetch en paralelo por fecha (datos históricos)
     const rows: DayRow[] = await Promise.all(
       dates.map(async (date): Promise<DayRow> => {
         const [polymarket, aemet, openweather, tomorrow, visual_crossing, weatherapi, accuweather, open_meteo] =
@@ -316,7 +380,7 @@ export async function POST(req: NextRequest) {
             fetchVisualCrossing(date, keys.visual_crossing),
             fetchWeatherApi(date, keys.weatherapi),
             fetchAccuWeather(date, keys.accuweather),
-            fetchOpenMeteo(date),  // siempre disponible
+            fetchOpenMeteo(date),  // siempre disponible (histórico)
           ])
 
         return {
@@ -327,7 +391,35 @@ export async function POST(req: NextRequest) {
       })
     )
 
-    return NextResponse.json({ rows, keysConfigured } satisfies ComparisonResponse)
+    // ── Predicción para mañana (APIs de forecast) ─────────────────────────
+    const tomorrowDate = getTomorrowDate()
+    const [
+      tmrAemet, tmrOpenweather, tmrTomorrow,
+      tmrVisualCrossing, tmrWeatherapi, tmrAccuweather, tmrOpenMeteo,
+    ] = await Promise.all([
+      fetchAemet(tomorrowDate, keys.aemet),
+      fetchOpenWeather(tomorrowDate, keys.openweather),
+      fetchTomorrow(tomorrowDate, keys.tomorrow),
+      fetchVisualCrossing(tomorrowDate, keys.visual_crossing),
+      fetchWeatherApiForecast(tomorrowDate, keys.weatherapi),  // forecast endpoint
+      fetchAccuWeather(tomorrowDate, keys.accuweather),
+      fetchOpenMeteoForecast(tomorrowDate),                    // forecast endpoint (gratis)
+    ])
+
+    const tomorrowSources: TomorrowSources = {
+      date: tomorrowDate,
+      sources: {
+        aemet:          tmrAemet,
+        openweather:    tmrOpenweather,
+        tomorrow:       tmrTomorrow,
+        visual_crossing: tmrVisualCrossing,
+        weatherapi:     tmrWeatherapi,
+        accuweather:    tmrAccuweather,
+        open_meteo:     tmrOpenMeteo,
+      },
+    }
+
+    return NextResponse.json({ rows, keysConfigured, tomorrowSources } satisfies ComparisonResponse)
   } catch (e: any) {
     console.error('[/api/comparison] Error:', e)
     return NextResponse.json({ error: e.message }, { status: 500 })
