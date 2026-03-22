@@ -110,14 +110,15 @@ export async function runDailySettlement(targetDate?: string) {
         if (!ts.slug) continue
         const mktToken = markets.tokens.find((t: any) => t.tempCelsius === ts.temp)
         if (mktToken) {
-          await supabase.from('simulation_snapshots').insert({
+          const { error: snapError } = await supabase.from('simulation_snapshots').insert({
             prediction_id:  pred.id,
             target_date:    today,
             slug:           ts.slug,
             token_temp:     ts.temp,
             price_snapshot: mktToken.price,
             snapshot_at:    new Date().toISOString(),
-          }).catch((e: any) => console.warn('Snapshot error:', e.message))
+          })
+          if (snapError) console.warn('Snapshot error:', snapError.message)
         }
       }
     }
