@@ -114,6 +114,18 @@ export default function ComparisonPage() {
   const [savedOp,  setSavedOp]  = useState<SavedOperation | null>(null)
   const [saveOpError, setSaveOpError] = useState<string | null>(null)
 
+  const loadHistoricalStats = useCallback(async () => {
+    setHistoricalLoading(true)
+    try {
+      const res = await fetch('/api/historical')
+      if (res.ok) {
+        const d: HistoricalStats = await res.json()
+        setHistorical(d)
+      }
+    } catch {}
+    finally { setHistoricalLoading(false) }
+  }, [])
+
   // ── Cargar pesos desde BD y estadísticas históricas al montar ────────────────
   useEffect(() => {
     // Pesos actuales de Supabase
@@ -139,18 +151,6 @@ export default function ComparisonPage() {
     // Estadísticas históricas — cargar siempre al montar
     loadHistoricalStats()
   }, [loadHistoricalStats])
-
-  const loadHistoricalStats = useCallback(async () => {
-    setHistoricalLoading(true)
-    try {
-      const res = await fetch('/api/historical')
-      if (res.ok) {
-        const d: HistoricalStats = await res.json()
-        setHistorical(d)
-      }
-    } catch {}
-    finally { setHistoricalLoading(false) }
-  }, [])
 
   const weightSum = Object.values(weights).reduce((a, b) => a + b, 0)
 
