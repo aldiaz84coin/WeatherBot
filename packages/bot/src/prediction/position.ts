@@ -1,81 +1,98 @@
 // src/prediction/position.ts
-// Construye la posición de 3 tokens a partir de una temperatura predicha
-// Restricción: coste total SIEMPRE < 0.80 USDC
+// Construye la posición de 2 tokens a partir de una temperatura predicha
+//
+// Lógica de selección:
+//   token_a = Math.ceil(ensemble_temp)      ← inmediato superior
+//   token_b = Math.ceil(ensemble_temp) + 1  ← siguiente
+//
+// Presupuesto: 0.40 USDC por token = 0.80 USDC total
 
 import { buildTokenSlug } from '../polymarket/slugs'
 import { GammaClient } from '../polymarket/gamma'
-import { addDays, format } from 'date-fns'
 
-// Distribución fija del presupuesto entre los 3 tokens
-// low: pred-1°  mid: pred°  high: pred+1°
-const BUDGET_DISTRIBUTION = {
-  low:  0.20,   // USDC
-  mid:  0.40,   // USDC
-  high: 0.20,   // USDC
+// ─── Presupuesto ──────────────────────────────────────────────────────────────
+
+export const BUDGET = {
+  a: 0.40,  // ceil(pred)
+  b: 0.40,  // ceil(pred) + 1
 } as const
 
-const TOTAL_BUDGET = Object.values(BUDGET_DISTRIBUTION).reduce((a, b) => a + b, 0)
-// Compile-time guard
-if (TOTAL_BUDGET > 0.80) throw new Error('BUG: budget exceeds 0.80 USDC limit')
+export const TOTAL_BUDGET = BUDGET.a + BUDGET.b  // 0.80 USDC
+
+// ─── Tipos ────────────────────────────────────────────────────────────────────
+
+export type TokenSlot = 'a' | 'b'
 
 export interface TokenPosition {
-  position: 'low' | 'mid' | 'high'
-  tempCelsius: number
-  slug: string
-  costUsdc: number
-  priceAtBuy: number | null   // precio actual en Polymarket (null si mercado no disponible)
-  shares: number | null
+  slot:         TokenSlot
+  tempCelsius:  number       // temperatura exacta del token (entera)
+  slug:         string       // slug de Polymarket
+  costUsdc:     number       // presupuesto asignado
+  priceAtBuy:   number | null  // precio YES en Polymarket al momento del cálculo
+  shares:       number | null  // costUsdc / priceAtBuy
 }
 
-export interface Position {
-  targetDate: string
-  predictedTemp: number
-  tokens: TokenPosition[]
-  totalCostUsdc: number       // siempre < 0.80
-  marketAvailable: boolean
+export interface TwoTokenPosition {
+  targetDate:       string
+  ensembleTemp:     number          // temperatura predicha (puede tener decimal)
+  tokenA:           TokenPosition   // ceil(pred)
+  tokenB:           TokenPosition   // ceil(pred) + 1
+  totalCostUsdc:    number          // siempre 0.80
+  marketAvailable:  boolean
 }
+
+// ─── Construcción de la posición ─────────────────────────────────────────────
 
 export async function buildPosition(
-  predictedTemp: number,
+  ensembleTemp: number,
   targetDate: string
-): Promise<Position> {
+): Promise<TwoTokenPosition> {
   const gamma = new GammaClient()
-  const rounded = Math.round(predictedTemp)
 
-  const tokenDefs: { position: 'low' | 'mid' | 'high'; tempCelsius: number }[] = [
-    { position: 'low',  tempCelsius: rounded - 1 },
-    { position: 'mid',  tempCelsius: rounded },
-    { position: 'high', tempCelsius: rounded + 1 },
+  // ceil: si pred = 32.0 → token_a = 32; si pred = 32.1 → token_a = 33
+  const ceilTemp = Math.ceil(ensembleTemp)
+
+  const defs: { slot: TokenSlot; tempCelsius: number }[] = [
+    { slot: 'a', tempCelsius: ceilTemp },
+    { slot: 'b', tempCelsius: ceilTemp + 1 },
   ]
 
-  const tokens: TokenPosition[] = []
+  const tokens: Record<TokenSlot, TokenPosition> = {} as any
   let marketAvailable = false
 
-  for (const def of tokenDefs) {
-    const slug = buildTokenSlug(targetDate, def.tempCelsius)
-    const cost = BUDGET_DISTRIBUTION[def.position]
+  for (const def of defs) {
+    const slug     = buildTokenSlug(targetDate, def.tempCelsius)
+    const costUsdc = BUDGET[def.slot]
 
     let priceAtBuy: number | null = null
-    let shares: number | null = null
+    let shares:     number | null = null
 
     try {
       priceAtBuy = await gamma.getTokenPrice(slug)
       if (priceAtBuy !== null && priceAtBuy > 0) {
-        shares = cost / priceAtBuy
+        shares = parseFloat((costUsdc / priceAtBuy).toFixed(4))
         marketAvailable = true
       }
     } catch {
-      // Mercado no disponible aún — se intentará más tarde
+      // Mercado no disponible aún — se reintentará en el job de apertura
     }
 
-    tokens.push({ position: def.position, tempCelsius: def.tempCelsius, slug, costUsdc: cost, priceAtBuy, shares })
+    tokens[def.slot] = {
+      slot:        def.slot,
+      tempCelsius: def.tempCelsius,
+      slug,
+      costUsdc,
+      priceAtBuy,
+      shares,
+    }
   }
 
   return {
     targetDate,
-    predictedTemp,
-    tokens,
-    totalCostUsdc: TOTAL_BUDGET,
+    ensembleTemp,
+    tokenA:          tokens.a,
+    tokenB:          tokens.b,
+    totalCostUsdc:   TOTAL_BUDGET,
     marketAvailable,
   }
 }
