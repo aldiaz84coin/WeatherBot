@@ -118,12 +118,19 @@ export default function ComparisonPage() {
     setHistoricalLoading(true)
     try {
       const res = await fetch('/api/historical')
-      if (res.ok) {
-        const d: HistoricalStats = await res.json()
-        setHistorical(d)
+      const d: HistoricalStats = await res.json()
+      if (!res.ok) {
+        console.error('[historical] Error del servidor:', d)
+        setHistorical({ totalDays: 0, earliestDate: null, latestDate: null, maes: {}, counts: {}, optimalWeights: null, recent: [], message: `Error: ${(d as any).error ?? res.status}` })
+        return
       }
-    } catch {}
-    finally { setHistoricalLoading(false) }
+      setHistorical(d)
+    } catch (e: any) {
+      console.error('[historical] Error de red:', e)
+      setHistorical({ totalDays: 0, earliestDate: null, latestDate: null, maes: {}, counts: {}, optimalWeights: null, recent: [], message: `Error de red: ${e.message}` })
+    } finally {
+      setHistoricalLoading(false)
+    }
   }, [])
 
   // ── Cargar pesos desde BD y estadísticas históricas al montar ────────────────
