@@ -6,6 +6,7 @@
 // – Columna por fuente con Δ respecto al mercado
 // – Sliders de pesos del ensemble configurables
 // – Propuesta de pesos óptimos calculada por MAE inverso
+// – Predicción ensemble para mañana
 
 import { useState, useCallback, useEffect } from 'react'
 
@@ -25,7 +26,15 @@ interface DayRow {
     open_meteo: SourceResult
   }
 }
-interface ComparisonResponse { rows: DayRow[]; keysConfigured: Record<string, boolean> }
+interface TomorrowSources {
+  date: string
+  sources: DayRow['sources']
+}
+interface ComparisonResponse {
+  rows: DayRow[]
+  keysConfigured: Record<string, boolean>
+  tomorrowSources?: TomorrowSources
+}
 
 // ─── Configuración de fuentes ─────────────────────────────────────────────────
 
@@ -128,6 +137,7 @@ export default function ComparisonPage() {
   const [keysConfigured, setKeysConfigured] = useState<Record<string, boolean>>({})
   const [savingWeights, setSavingWeights] = useState(false)
   const [savedOk, setSavedOk] = useState(false)
+  const [tomorrowSources, setTomorrowSources] = useState<TomorrowSources | null>(null)
 
   // Cargar pesos actuales desde Supabase al montar
   useEffect(() => {
@@ -177,6 +187,7 @@ export default function ComparisonPage() {
       const json: ComparisonResponse = await res.json()
       setData(json)
       setKeysConfigured(json.keysConfigured)
+      setTomorrowSources(json.tomorrowSources ?? null)
       setProgress('')
     } catch (e: any) {
       setError(e.message ?? 'Error desconocido')
@@ -220,53 +231,35 @@ export default function ComparisonPage() {
 
   const opt = data ? computeOptimalWeights(data.rows) : null
 
+  // ─── Render ────────────────────────────────────────────────────────────────
+
   return (
-    <div className="space-y-6">
+    <div className="min-h-screen bg-gray-950 text-white p-6 space-y-6">
 
       {/* ── Cabecera ──────────────────────────────────────────────────────── */}
       <div>
         <h1 className="text-xl font-semibold text-white">Comparativa de fuentes</h1>
-        <p className="text-sm text-gray-400 mt-1">
-          Temperatura implícita de Polymarket vs cada fuente meteorológica · últimos 8 días
+        <p className="text-sm text-gray-500 mt-1">
+          Temperatura implícita de Polymarket vs previsiones meteorológicas · Madrid · Últimos 8 días
         </p>
       </div>
 
-      {/* ── Panel keys ───────────────────────────────────────────────────── */}
-      <section className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      {/* ── API Keys (colapsable) ─────────────────────────────────────────── */}
+      <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <button
           onClick={() => setShowKeys(v => !v)}
-          className="w-full flex items-center justify-between px-5 py-3 text-left hover:bg-gray-800/50 transition-colors"
+          className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors"
         >
-          <span className="text-sm font-medium text-gray-300">
-            API Keys
-            <span className="ml-2 text-xs text-gray-500">
-              {Object.values(keysConfigured).filter(Boolean).length} de {SOURCES.filter(s => !s.free).length} configuradas en Vercel
-            </span>
-          </span>
-          <span className="text-gray-500 text-xs">{showKeys ? '▲' : '▼'}</span>
+          <span>{showKeys ? '▾' : '▸'}</span>
+          <span>API Keys (opcional — sobreescribe las variables de entorno)</span>
         </button>
 
         {showKeys && (
-          <div className="px-5 pb-5 pt-2 border-t border-gray-800">
-            <p className="text-xs text-gray-500 mb-4">
-              Las keys se leen de las variables de entorno de Vercel (
-              <code className="text-gray-400">AEMET_API_KEY</code>,{' '}
-              <code className="text-gray-400">OPENWEATHER_API_KEY</code>,{' '}
-              <code className="text-gray-400">TOMORROW_IO_KEY</code>,{' '}
-              <code className="text-gray-400">VISUAL_CROSSING_KEY</code>,{' '}
-              <code className="text-gray-400">WEATHERAPI_KEY</code>,{' '}
-              <code className="text-gray-400">ACCUWEATHER_API_KEY</code>).
-              Si no están en Vercel, puedes introducirlas aquí temporalmente (solo se usan en esta sesión, nunca se guardan).
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          <div className="mt-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {SOURCES.filter(s => !s.free).map(s => (
                 <div key={s.key}>
-                  <label className="block text-xs text-gray-500 mb-1">
-                    {s.name}
-                    {keysConfigured[s.key] && (
-                      <span className="ml-2 text-green-500">✓ en Vercel</span>
-                    )}
-                  </label>
+                  <label className="block text-xs text-gray-500 mb-1">{s.name}</label>
                   <input
                     type="password"
                     placeholder={keysConfigured[s.key] ? '(configurada en Vercel)' : 'Pegar API key…'}
@@ -495,6 +488,82 @@ export default function ComparisonPage() {
             </div>
           </section>
 
+          {/* ── Predicción para mañana ──────────────────────────────────── */}
+          {tomorrowSources && (() => {
+            const ensemble = computeWeighted(tomorrowSources.sources, weights)
+            return (
+              <section className="bg-gray-900 border border-blue-900/50 rounded-xl p-5">
+                <div className="flex items-start justify-between gap-4 flex-wrap">
+                  <div>
+                    <h2 className="text-sm font-semibold text-blue-300 flex items-center gap-2">
+                      🔮 Predicción para mañana
+                      <span className="text-gray-500 font-normal text-xs">
+                        {tomorrowSources.date}
+                      </span>
+                    </h2>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Ensemble ponderado con los pesos configurados arriba.
+                      Open-Meteo siempre disponible; el resto requiere API key.
+                    </p>
+                  </div>
+                  {ensemble !== null && (
+                    <div className="text-right shrink-0">
+                      <p className="text-3xl font-bold text-blue-400 leading-none">
+                        {ensemble}°C
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">Tmax estimada</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Detalle por fuente */}
+                <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+                  {SOURCES.map(s => {
+                    const sr = tomorrowSources.sources[s.key]
+                    const v = sr?.tmax
+                    const w = weights[s.key]
+                    return (
+                      <div
+                        key={s.key}
+                        className={`rounded-lg px-3 py-2 border text-center ${
+                          v !== null
+                            ? 'bg-gray-800 border-gray-700'
+                            : 'bg-gray-950 border-gray-800 opacity-50'
+                        }`}
+                      >
+                        <p className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">
+                          {s.short}
+                        </p>
+                        {v !== null ? (
+                          <>
+                            <p className="text-base font-bold text-white mt-0.5">{v}°C</p>
+                            <p className="text-[10px] text-gray-500">{Math.round(w * 100)}%</p>
+                          </>
+                        ) : (
+                          <>
+                            <p className="text-xs text-gray-600 mt-1">—</p>
+                            <p
+                              className="text-[10px] text-gray-700 mt-0.5 truncate"
+                              title={sr?.err ?? ''}
+                            >
+                              {sr?.err?.substring(0, 14) ?? 'sin datos'}
+                            </p>
+                          </>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+
+                {ensemble === null && (
+                  <p className="text-xs text-yellow-600 mt-3">
+                    ⚠ Sin datos suficientes para calcular el ensemble (ninguna fuente devolvió previsión para mañana).
+                  </p>
+                )}
+              </section>
+            )
+          })()}
+
           {/* ── Propuesta de pesos óptimos ──────────────────────────────── */}
           {opt && (
             <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
@@ -508,56 +577,32 @@ export default function ComparisonPage() {
                 </div>
                 <button
                   onClick={() => applyOptWeights(opt.weights)}
-                  className="text-xs px-3 py-1.5 rounded-lg border border-blue-800 bg-blue-950 text-blue-400
-                             hover:bg-blue-900 transition-colors whitespace-nowrap"
+                  className="text-xs px-3 py-1.5 rounded-lg bg-green-950 border border-green-800 text-green-400 hover:bg-green-900 transition-colors"
                 >
-                  Aplicar todos ↑
+                  Aplicar pesos
                 </button>
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
                 {SOURCES.map(s => {
-                  const ow  = opt.weights[s.key]
                   const mae = opt.maes[s.key]
-                  const cnt = opt.counts[s.key] ?? 0
-                  const curr = weights[s.key]
-                  const diff = ow !== undefined ? Math.round((ow - curr) * 100) : 0
-
+                  const cnt = opt.counts[s.key]
+                  const w = opt.weights[s.key]
                   return (
-                    <div key={s.key} className="bg-gray-950 border border-gray-800 rounded-xl p-3">
-                      <p className="text-xs text-gray-500 mb-1">{s.name}</p>
-                      <p className="text-2xl font-semibold text-white">
-                        {ow !== undefined ? Math.round(ow * 100) : '—'}
-                        {ow !== undefined && <span className="text-base">%</span>}
-                      </p>
-                      {mae !== undefined && (
-                        <p className="text-[10px] text-gray-600 mt-1">
-                          MAE {mae.toFixed(2)}°C · {cnt}d
+                    <div key={s.key} className="bg-gray-800 rounded-lg px-3 py-2 text-center">
+                      <p className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">{s.short}</p>
+                      <p className="text-base font-bold text-white mt-0.5">{Math.round(w * 100)}%</p>
+                      {mae != null ? (
+                        <p className={`text-[10px] mt-0.5 ${errColor(mae)}`}>
+                          MAE {mae.toFixed(1)}° ({cnt}d)
                         </p>
-                      )}
-                      {ow !== undefined && diff !== 0 && (
-                        <p className={`text-[10px] mt-0.5 ${diff > 0 ? 'text-green-500' : 'text-orange-500'}`}>
-                          {diff > 0 ? '↑' : '↓'} {Math.abs(diff)}pp vs actual
-                        </p>
-                      )}
-                      {ow !== undefined && (
-                        <button
-                          onClick={() => setWeights(w => ({ ...w, [s.key]: ow }))}
-                          className="mt-2 text-[10px] px-2 py-0.5 rounded border border-gray-700 text-gray-500
-                                     hover:text-white hover:border-gray-500 transition-colors"
-                        >
-                          Aplicar
-                        </button>
+                      ) : (
+                        <p className="text-[10px] text-gray-600 mt-0.5">sin datos</p>
                       )}
                     </div>
                   )
                 })}
               </div>
-
-              <p className="text-xs text-gray-600 mt-4">
-                ⚠ Con 8 días de datos la propuesta puede ser ruidosa. Para pesos más robustos,
-                ejecuta el backtest completo (365 días) desde la página de Entrenamiento.
-              </p>
             </section>
           )}
         </>
