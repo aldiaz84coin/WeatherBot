@@ -1,13 +1,7 @@
 'use client'
 
 // packages/dashboard/app/comparison/page.tsx
-// Página: Comparativa de fuentes meteo vs temperatura implícita de Polymarket
-// – Últimos 8 días
-// – Columna por fuente con Δ respecto al mercado
-// – Sliders de pesos del ensemble configurables
-// – Propuesta de pesos óptimos calculada por MAE inverso
-// – Predicción ensemble para mañana
-// – ⭐ Registro de operación simulada: guarda pesos + predicción + trades en BD
+// Comparativa de fuentes + ⭐ pesos óptimos calculados sobre histórico completo
 
 import { useState, useCallback, useEffect } from 'react'
 
@@ -28,16 +22,27 @@ interface ComparisonResponse {
   rows: DayRow[]
   keysConfigured: Record<string, boolean>
   tomorrowSources?: TomorrowSources
+  historicalSaved?: number
 }
 
-// Resultado de guardar la operación
+interface HistoricalStats {
+  totalDays: number
+  earliestDate: string | null
+  latestDate: string | null
+  maes: Record<string, number>
+  counts: Record<string, number>
+  optimalWeights: Record<string, number> | null
+  recent: Array<Record<string, number | string | null>>
+  message?: string
+}
+
 interface SavedOperation {
   predictionId: string
-  targetDate:   string
+  targetDate: string
   ensembleTemp: number
   tokenA: { temp: number; slug: string; price: number | null; shares: number | null; cost: number }
   tokenB: { temp: number; slug: string; price: number | null; shares: number | null; cost: number }
-  stake:  number
+  stake: number
   isUpdate: boolean
 }
 
@@ -83,6 +88,8 @@ function getTomorrowDate(): string {
 // ─── Componente principal ─────────────────────────────────────────────────────
 
 export default function ComparisonPage() {
+  const today = new Date()
+  const [sources]         = useState(SOURCES)
   const [data,           setData]           = useState<ComparisonResponse | null>(null)
   const [tomorrowSources, setTomorrowSources] = useState<TomorrowSources | null>(null)
   const [loading,        setLoading]        = useState(false)
@@ -95,14 +102,21 @@ export default function ComparisonPage() {
   const [savingWeights,  setSavingWeights]  = useState(false)
   const [savedOk,        setSavedOk]        = useState(false)
 
-  // ── Estado de la operación ──────────────────────────────────────────────────
-  const [stake,           setStake]           = useState(20)
-  const [savingOp,        setSavingOp]        = useState(false)
-  const [savedOp,         setSavedOp]         = useState<SavedOperation | null>(null)
-  const [saveOpError,     setSaveOpError]     = useState<string | null>(null)
+  // ── Histórico ────────────────────────────────────────────────────────────────
+  const [historical,     setHistorical]     = useState<HistoricalStats | null>(null)
+  const [historicalLoading, setHistoricalLoading] = useState(false)
+  const [showHistoricalTable, setShowHistoricalTable] = useState(false)
+  const [lastSaved,      setLastSaved]      = useState<number | null>(null)
 
-  // ── Cargar pesos desde la BD al montar ──────────────────────────────────────
+  // ── Operación ────────────────────────────────────────────────────────────────
+  const [stake,    setStake]    = useState(20)
+  const [savingOp, setSavingOp] = useState(false)
+  const [savedOp,  setSavedOp]  = useState<SavedOperation | null>(null)
+  const [saveOpError, setSaveOpError] = useState<string | null>(null)
+
+  // ── Cargar pesos desde BD y estadísticas históricas al montar ────────────────
   useEffect(() => {
+    // Pesos actuales de Supabase
     fetch('/api/sources')
       .then(r => r.json())
       .then(d => {
@@ -121,6 +135,21 @@ export default function ComparisonPage() {
         }
       })
       .catch(() => {})
+
+    // Estadísticas históricas
+    loadHistoricalStats()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadHistoricalStats = useCallback(async () => {
+    setHistoricalLoading(true)
+    try {
+      const res = await fetch('/api/historical')
+      if (res.ok) {
+        const d: HistoricalStats = await res.json()
+        setHistorical(d)
+      }
+    } catch {}
+    finally { setHistoricalLoading(false) }
   }, [])
 
   const weightSum = Object.values(weights).reduce((a, b) => a + b, 0)
@@ -136,7 +165,7 @@ export default function ComparisonPage() {
   }, [weights])
 
   const fetchData = useCallback(async () => {
-    setLoading(true); setError(null); setSavedOp(null)
+    setLoading(true); setError(null); setSavedOp(null); setLastSaved(null)
     setProgress('Consultando Polymarket y fuentes meteorológicas…')
     try {
       const res = await fetch('/api/comparison', {
@@ -149,19 +178,24 @@ export default function ComparisonPage() {
       setData(json)
       setKeysConfigured(json.keysConfigured)
       setTomorrowSources(json.tomorrowSources ?? null)
+
+      // Mostrar cuántos registros se guardaron y refrescar stats históricas
+      if (json.historicalSaved && json.historicalSaved > 0) {
+        setLastSaved(json.historicalSaved)
+        await loadHistoricalStats()
+      }
       setProgress('')
     } catch (e: any) {
       setError(e.message ?? 'Error desconocido'); setProgress('')
     } finally {
       setLoading(false)
     }
-  }, [keyOverrides])
+  }, [keyOverrides, loadHistoricalStats])
 
   const applyOptWeights = useCallback((optW: Record<SourceKey, number>) => {
     setWeights({ ...optW })
   }, [])
 
-  // ── Guardar pesos en Supabase ───────────────────────────────────────────────
   const saveWeightsToSupabase = useCallback(async () => {
     setSavingWeights(true)
     try {
@@ -186,23 +220,18 @@ export default function ComparisonPage() {
     }
   }, [weights])
 
-  // ── Calcular ensemble con los pesos actuales ────────────────────────────────
-  const computeEnsemble = useCallback((sources: TomorrowSources['sources']): number | null => {
-    let weightedSum = 0, totalW = 0
+  const computeEnsemble = useCallback((srcs: TomorrowSources['sources']): number | null => {
+    let ws = 0, tw = 0
     for (const s of SOURCES) {
-      const v = sources[s.key]?.tmax
-      if (v !== null && v !== undefined) {
-        weightedSum += v * weights[s.key]
-        totalW      += weights[s.key]
-      }
+      const v = srcs[s.key]?.tmax
+      if (v !== null && v !== undefined) { ws += v * weights[s.key]; tw += weights[s.key] }
     }
-    if (totalW === 0) return null
-    return Math.round((weightedSum / totalW) * 10) / 10
+    return tw > 0 ? Math.round((ws / tw) * 10) / 10 : null
   }, [weights])
 
-  // ── Calcular pesos óptimos por MAE inverso (últimos 8 días) ────────────────
+  // ── Pesos óptimos desde los últimos 8 días (ventana corta) ───────────────────
   const opt = data ? (() => {
-    const maes:   Partial<Record<SourceKey, number>> = {}
+    const maes: Partial<Record<SourceKey, number>> = {}
     const counts: Partial<Record<SourceKey, number>> = {}
     for (const row of data.rows) {
       const ref = row.polymarket.temp
@@ -232,18 +261,14 @@ export default function ComparisonPage() {
     return { weights: optWeights, maes: avgMae, counts }
   })() : null
 
-  // ── ⭐ Registrar operación simulada ─────────────────────────────────────────
+  // ── Registrar operación ───────────────────────────────────────────────────────
   const registerOperation = useCallback(async () => {
     if (!tomorrowSources) return
     const ensemble = computeEnsemble(tomorrowSources.sources)
-    if (ensemble === null) {
-      setSaveOpError('Sin datos de fuentes para calcular el ensemble.')
-      return
-    }
+    if (ensemble === null) { setSaveOpError('Sin datos suficientes.'); return }
 
     setSavingOp(true); setSaveOpError(null); setSavedOp(null)
 
-    // Snapshot sourceTemps
     const sourceTemps: Record<string, number> = {}
     for (const s of SOURCES) {
       const v = tomorrowSources.sources[s.key]?.tmax
@@ -255,25 +280,18 @@ export default function ComparisonPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          weights,
-          optWeights: opt?.weights ?? null,
-          ensembleTemp: ensemble,
-          sourceTemps,
-          targetDate: tomorrowSources.date,
-          stake,
+          weights, optWeights: opt?.weights ?? null,
+          ensembleTemp: ensemble, sourceTemps,
+          targetDate: tomorrowSources.date, stake,
         }),
       })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`)
-
       setSavedOp({
-        predictionId: json.prediction.id,
-        targetDate:   json.prediction.target_date,
+        predictionId: json.prediction.id, targetDate: json.prediction.target_date,
         ensembleTemp: json.prediction.ensemble_temp,
-        tokenA:       json.tokenA,
-        tokenB:       json.tokenB,
-        stake,
-        isUpdate:     json.isUpdate,
+        tokenA: json.tokenA, tokenB: json.tokenB,
+        stake, isUpdate: json.isUpdate,
       })
     } catch (e: any) {
       setSaveOpError(e.message ?? 'Error desconocido')
@@ -282,9 +300,9 @@ export default function ComparisonPage() {
     }
   }, [tomorrowSources, weights, opt, stake, computeEnsemble])
 
-  // ─── Render ───────────────────────────────────────────────────────────────
-
   const ensemble = tomorrowSources ? computeEnsemble(tomorrowSources.sources) : null
+
+  // ── Render ────────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-6 p-4 sm:p-6 max-w-7xl mx-auto">
@@ -307,14 +325,206 @@ export default function ComparisonPage() {
         </button>
       </div>
 
-      {progress && (
-        <p className="text-xs text-blue-400 animate-pulse">{progress}</p>
-      )}
+      {progress && <p className="text-xs text-blue-400 animate-pulse">{progress}</p>}
       {error && (
         <div className="bg-red-950 border border-red-800 rounded-xl px-4 py-3 text-red-400 text-sm">
           {error}
         </div>
       )}
+
+      {/* ⭐ Bloque histórico ──────────────────────────────────────────────────── */}
+      <section className={`border rounded-xl p-5 ${
+        historical && historical.totalDays > 0
+          ? 'bg-gray-900 border-blue-900/60'
+          : 'bg-gray-900 border-gray-800'
+      }`}>
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <h2 className="text-sm font-medium text-gray-200 flex items-center gap-2">
+              📊 Histórico acumulado
+              {historicalLoading && (
+                <span className="text-xs text-gray-500 animate-pulse">cargando…</span>
+              )}
+            </h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Cada vez que pulsas "Actualizar datos", los días resueltos de Polymarket se guardan
+              automáticamente. Con suficientes registros, los pesos óptimos son mucho más robustos
+              que con la ventana de 8 días.
+            </p>
+          </div>
+          <button
+            onClick={loadHistoricalStats}
+            disabled={historicalLoading}
+            className="shrink-0 text-xs px-2.5 py-1.5 rounded-lg border border-gray-700 text-gray-400
+                       hover:text-white hover:border-gray-500 transition-colors disabled:opacity-50"
+          >
+            ↺ Refrescar
+          </button>
+        </div>
+
+        {!historical || historical.totalDays === 0 ? (
+          <div className="bg-gray-950 border border-dashed border-gray-700 rounded-lg px-4 py-6 text-center">
+            <p className="text-gray-500 text-sm">
+              {historical?.message ?? 'Sin registros todavía.'}
+            </p>
+            <p className="text-gray-600 text-xs mt-1">
+              Pulsa "Actualizar datos" para empezar a acumular histórico.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* KPIs */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+              <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+                <p className="text-xs text-gray-500">Días guardados</p>
+                <p className="text-2xl font-bold text-blue-400 mt-0.5">{historical.totalDays}</p>
+              </div>
+              <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+                <p className="text-xs text-gray-500">Primer registro</p>
+                <p className="text-sm font-medium text-white mt-0.5">
+                  {historical.earliestDate ?? '—'}
+                </p>
+              </div>
+              <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+                <p className="text-xs text-gray-500">Último registro</p>
+                <p className="text-sm font-medium text-white mt-0.5">
+                  {historical.latestDate ?? '—'}
+                </p>
+              </div>
+              <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
+                <p className="text-xs text-gray-500">Último guardado</p>
+                <p className="text-sm font-medium mt-0.5">
+                  {lastSaved !== null
+                    ? <span className="text-green-400">+{lastSaved} registro{lastSaved !== 1 ? 's' : ''}</span>
+                    : <span className="text-gray-600">—</span>
+                  }
+                </p>
+              </div>
+            </div>
+
+            {/* Pesos óptimos históricos */}
+            {historical.optimalWeights && (
+              <div className="bg-gray-950 border border-blue-900/40 rounded-xl p-4 mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="text-sm font-medium text-blue-300">
+                      Pesos óptimos · {historical.totalDays} días de histórico
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      MAE inverso calculado sobre todos los registros acumulados en la BD.
+                      {historical.totalDays >= 30
+                        ? ' Con más de 30 días, estos pesos son estadísticamente significativos.'
+                        : ` Necesitas al menos 30 días para mayor robustez (faltan ${30 - historical.totalDays}).`}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => applyOptWeights(historical.optimalWeights as Record<SourceKey, number>)}
+                    className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-blue-900/60 border border-blue-700
+                               text-blue-300 hover:bg-blue-800/60 transition-colors"
+                  >
+                    Aplicar
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+                  {SOURCES.map(s => {
+                    const w    = historical.optimalWeights![s.key] ?? 0
+                    const mae  = historical.maes[s.key]
+                    const cnt  = historical.counts[s.key] ?? 0
+                    const curr = weights[s.key]
+                    const diff = Math.round((w - curr) * 100)
+
+                    return (
+                      <div key={s.key} className="bg-gray-900 rounded-lg p-2.5 border border-gray-800 text-center">
+                        <p className="text-[10px] text-gray-500 mb-0.5">{s.short}</p>
+                        <p className="text-lg font-bold text-white">{Math.round(w * 100)}%</p>
+                        {mae !== undefined && (
+                          <p className="text-[9px] text-gray-600 mt-0.5">MAE {mae.toFixed(2)}° · {cnt}d</p>
+                        )}
+                        {diff !== 0 && (
+                          <p className={`text-[9px] mt-0.5 ${diff > 0 ? 'text-green-500' : 'text-orange-500'}`}>
+                            {diff > 0 ? '↑' : '↓'}{Math.abs(diff)}pp
+                          </p>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Tabla de últimos registros (colapsable) */}
+            {historical.recent && historical.recent.length > 0 && (
+              <div>
+                <button
+                  onClick={() => setShowHistoricalTable(v => !v)}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+                >
+                  {showHistoricalTable ? '▲ Ocultar' : '▼ Ver'} últimos {historical.recent.length} registros
+                </button>
+
+                {showHistoricalTable && (
+                  <div className="mt-3 overflow-x-auto">
+                    <table className="w-full text-xs" style={{ minWidth: 700 }}>
+                      <thead>
+                        <tr className="border-b border-gray-800">
+                          <th className="text-left pb-2 pr-3 text-gray-500 font-normal">Fecha</th>
+                          <th className="text-right pb-2 pr-3 text-yellow-600 font-normal">Polymarket</th>
+                          {SOURCES.map(s => (
+                            <th key={s.key} className="text-right pb-2 pr-3 text-gray-500 font-normal">
+                              {s.short}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {historical.recent.map((row: any) => (
+                          <tr key={row.date} className="border-b border-gray-800/40 hover:bg-gray-800/20">
+                            <td className="py-1.5 pr-3 text-gray-400">{row.date}</td>
+                            <td className="py-1.5 pr-3 text-right font-medium text-yellow-400">
+                              {row.polymarket_temp}°C
+                            </td>
+                            {[
+                              ['open_meteo', 'open_meteo_tmax'],
+                              ['aemet', 'aemet_tmax'],
+                              ['visual_crossing', 'visual_crossing_tmax'],
+                              ['weatherapi', 'weatherapi_tmax'],
+                              ['openweather', 'openweather_tmax'],
+                              ['tomorrow', 'tomorrow_tmax'],
+                              ['accuweather', 'accuweather_tmax'],
+                            ].map(([key, col]) => {
+                              const v = row[col]
+                              const delta = v != null && row.polymarket_temp != null
+                                ? parseFloat((v - row.polymarket_temp).toFixed(1))
+                                : null
+                              return (
+                                <td key={key} className="py-1.5 pr-3 text-right">
+                                  {v != null ? (
+                                    <span className={delta !== null ? errColor(Math.abs(delta)) : 'text-gray-300'}>
+                                      {v}°
+                                      {delta !== null && (
+                                        <span className="ml-0.5 text-[9px]">
+                                          {delta > 0 ? '+' : ''}{delta}
+                                        </span>
+                                      )}
+                                    </span>
+                                  ) : (
+                                    <span className="text-gray-700">—</span>
+                                  )}
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </section>
 
       {/* ── Pesos del ensemble ─────────────────────────────────────────────── */}
       <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
@@ -322,13 +532,14 @@ export default function ComparisonPage() {
           <div>
             <h2 className="text-sm font-medium text-gray-300">Pesos del ensemble</h2>
             <p className={`text-xs mt-0.5 ${Math.abs(weightSum - 1) < 0.01 ? 'text-gray-500' : 'text-yellow-400'}`}>
-              Suma: {(weightSum * 100).toFixed(0)}% {Math.abs(weightSum - 1) > 0.01 && '— normaliza antes de guardar'}
+              Suma: {(weightSum * 100).toFixed(0)}%{' '}
+              {Math.abs(weightSum - 1) > 0.01 && '— normaliza antes de guardar'}
             </p>
           </div>
           <div className="flex gap-2 flex-wrap justify-end">
             <button onClick={normalize}
-              className="text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-white
-                         hover:border-gray-500 transition-colors">
+              className="text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400
+                         hover:text-white hover:border-gray-500 transition-colors">
               Normalizar
             </button>
             <button onClick={saveWeightsToSupabase} disabled={savingWeights}
@@ -367,7 +578,14 @@ export default function ComparisonPage() {
       {data && (
         <>
           <section className="bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto">
-            <h2 className="text-sm font-medium text-gray-300 mb-4">Últimos 8 días</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-sm font-medium text-gray-300">Últimos 8 días</h2>
+              {data.historicalSaved !== undefined && data.historicalSaved > 0 && (
+                <span className="text-xs text-green-400 bg-green-950 border border-green-800 px-2 py-0.5 rounded-full">
+                  +{data.historicalSaved} guardado{data.historicalSaved !== 1 ? 's' : ''} en histórico
+                </span>
+              )}
+            </div>
             <table className="w-full text-xs text-left border-collapse min-w-[640px]">
               <thead>
                 <tr className="border-b border-gray-800">
@@ -392,7 +610,12 @@ export default function ComparisonPage() {
                   })()
                   return (
                     <tr key={row.date} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
-                      <td className="py-2 pr-4 text-gray-300">{fmtDate(row.date)}</td>
+                      <td className="py-2 pr-4 text-gray-300">
+                        {fmtDate(row.date)}
+                        {row.polymarket.resolved && (
+                          <span className="ml-1 text-[9px] text-green-600">✓</span>
+                        )}
+                      </td>
                       <td className="py-2 pr-4">
                         {ref !== null
                           ? <span className="text-white font-medium">{ref}°</span>
@@ -431,14 +654,17 @@ export default function ComparisonPage() {
             </table>
           </section>
 
-          {/* ── Pesos óptimos propuestos ─────────────────────────────────── */}
+          {/* ── Pesos óptimos (ventana 8 días) ─────────────────────────── */}
           {opt && (
             <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
               <div className="flex items-center justify-between mb-4">
                 <div>
-                  <h2 className="text-sm font-medium text-gray-300">Pesos óptimos propuestos</h2>
+                  <h2 className="text-sm font-medium text-gray-300">
+                    Pesos óptimos · últimos 8 días
+                    <span className="ml-2 text-xs text-gray-600 font-normal">ventana corta</span>
+                  </h2>
                   <p className="text-xs text-gray-500 mt-0.5">
-                    Calculados por MAE inverso vs temperatura implícita de Polymarket.
+                    MAE inverso vs temperatura implícita de Polymarket (solo 8 días — usa el histórico para mayor robustez).
                   </p>
                 </div>
                 <button onClick={() => applyOptWeights(opt.weights)}
@@ -477,221 +703,148 @@ export default function ComparisonPage() {
       )}
 
       {/* ── Predicción para mañana ─────────────────────────────────────────── */}
-      {tomorrowSources && (() => {
-        return (
-          <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h2 className="text-sm font-medium text-gray-300">
-                  Predicción para mañana
-                  <span className="ml-2 text-xs text-gray-500">{fmtDate(tomorrowSources.date)}</span>
-                </h2>
-                <p className="text-xs text-gray-500 mt-0.5">
-                  Ensemble con los pesos actuales. Open-Meteo siempre disponible; el resto requiere API key.
-                </p>
+      {tomorrowSources && (
+        <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-sm font-medium text-gray-300">
+                Predicción para mañana
+                <span className="ml-2 text-xs text-gray-500">{fmtDate(tomorrowSources.date)}</span>
+              </h2>
+            </div>
+            {ensemble !== null && (
+              <div className="text-right shrink-0">
+                <p className="text-3xl font-bold text-blue-400 leading-none">{ensemble}°C</p>
+                <p className="text-xs text-gray-500 mt-1">Tmax estimada</p>
               </div>
-              {ensemble !== null && (
-                <div className="text-right shrink-0">
-                  <p className="text-3xl font-bold text-blue-400 leading-none">{ensemble}°C</p>
-                  <p className="text-xs text-gray-500 mt-1">Tmax estimada</p>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+            {SOURCES.map(s => {
+              const sr = tomorrowSources.sources[s.key]
+              const v  = sr?.tmax
+              const w  = weights[s.key]
+              return (
+                <div key={s.key}
+                  className={`rounded-lg px-3 py-2 border text-center ${
+                    v !== null ? 'bg-gray-800 border-gray-700' : 'bg-gray-950 border-gray-800 opacity-50'
+                  }`}>
+                  <p className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">{s.short}</p>
+                  {v !== null ? (
+                    <>
+                      <p className="text-base font-bold text-white mt-0.5">{v}°C</p>
+                      <p className="text-[10px] text-gray-500">{Math.round(w * 100)}%</p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-xs text-gray-600 mt-1">—</p>
+                      <p className="text-[10px] text-gray-700 mt-0.5 truncate" title={sr?.err ?? ''}>
+                        {sr?.err?.substring(0, 14) ?? 'sin datos'}
+                      </p>
+                    </>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Registrar operación */}
+          {ensemble !== null && (
+            <div className="mt-6 border-t border-gray-800 pt-5">
+              <div className="flex flex-col sm:flex-row sm:items-end gap-4">
+                <div className="flex-1">
+                  <h3 className="text-sm font-medium text-gray-300 mb-1">Registrar operación simulada</h3>
+                  <p className="text-xs text-gray-500">
+                    Tokens: <span className="text-white">{Math.ceil(ensemble)}°C</span> y{' '}
+                    <span className="text-white">{Math.ceil(ensemble) + 1}°C</span> ·{' '}
+                    <span className="text-white">{stake / 2} USD cada uno</span>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <label className="text-xs text-gray-400 whitespace-nowrap">Stake total</label>
+                  <div className="relative">
+                    <input
+                      type="number" min={1} max={1000} step={1} value={stake}
+                      onChange={e => setStake(Math.max(1, parseInt(e.target.value) || 20))}
+                      className="w-20 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5
+                                 text-white text-sm text-right focus:outline-none focus:border-blue-600"
+                    />
+                    <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 text-xs pointer-events-none">
+                      USD
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={registerOperation}
+                  disabled={savingOp}
+                  className="shrink-0 px-5 py-2 rounded-lg bg-violet-600 hover:bg-violet-500
+                             disabled:opacity-50 text-white text-sm font-medium transition-colors"
+                >
+                  {savingOp ? '⟳ Registrando…' : '⭐ Registrar operación'}
+                </button>
+              </div>
+              {saveOpError && (
+                <div className="mt-3 bg-red-950 border border-red-800 rounded-lg px-4 py-2.5 text-red-400 text-xs">
+                  {saveOpError}
+                </div>
+              )}
+              {savedOp && (
+                <div className="mt-4 bg-violet-950/60 border border-violet-800 rounded-xl p-4">
+                  <div className="flex items-start justify-between mb-3">
+                    <div>
+                      <p className="text-sm font-medium text-violet-300">
+                        {savedOp.isUpdate ? '🔄 Operación actualizada' : '✅ Operación registrada'}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        {fmtDate(savedOp.targetDate)} · ID: {savedOp.predictionId.substring(0, 8)}…
+                      </p>
+                    </div>
+                    <p className="text-lg font-bold text-white shrink-0">{savedOp.ensembleTemp}°C</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {[
+                      { label: 'Token A', token: savedOp.tokenA, color: 'text-violet-400' },
+                      { label: 'Token B', token: savedOp.tokenB, color: 'text-blue-400' },
+                    ].map(({ label, token, color }) => (
+                      <div key={label} className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs text-gray-500 font-medium uppercase">{label}</span>
+                          <span className={`text-xs font-bold ${color}`}>{token.temp}°C</span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-1 text-center mt-2">
+                          <div>
+                            <p className="text-[9px] text-gray-600">Coste</p>
+                            <p className="text-xs font-medium text-white">${token.cost}</p>
+                          </div>
+                          <div>
+                            <p className="text-[9px] text-gray-600">Precio</p>
+                            <p className="text-xs font-medium text-white">
+                              {token.price !== null ? token.price.toFixed(3) : <span className="text-gray-600">N/D</span>}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[9px] text-gray-600">Shares</p>
+                            <p className="text-xs font-medium text-white">
+                              {token.shares !== null ? token.shares.toFixed(2) : <span className="text-gray-600">N/D</span>}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between text-xs text-gray-500">
+                    <span>Stake total: <span className="text-white font-medium">${savedOp.stake}</span></span>
+                    <a href="/predictions" className="text-blue-400 hover:text-blue-300 transition-colors">
+                      Ver operaciones →
+                    </a>
+                  </div>
                 </div>
               )}
             </div>
-
-            {/* Detalle por fuente */}
-            <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
-              {SOURCES.map(s => {
-                const sr = tomorrowSources.sources[s.key]
-                const v  = sr?.tmax
-                const w  = weights[s.key]
-                return (
-                  <div key={s.key}
-                    className={`rounded-lg px-3 py-2 border text-center ${
-                      v !== null ? 'bg-gray-800 border-gray-700' : 'bg-gray-950 border-gray-800 opacity-50'
-                    }`}>
-                    <p className="text-[10px] text-gray-500 font-medium uppercase tracking-wide">{s.short}</p>
-                    {v !== null ? (
-                      <>
-                        <p className="text-base font-bold text-white mt-0.5">{v}°C</p>
-                        <p className="text-[10px] text-gray-500">{Math.round(w * 100)}%</p>
-                      </>
-                    ) : (
-                      <>
-                        <p className="text-xs text-gray-600 mt-1">—</p>
-                        <p className="text-[10px] text-gray-700 mt-0.5 truncate" title={sr?.err ?? ''}>
-                          {sr?.err?.substring(0, 14) ?? 'sin datos'}
-                        </p>
-                      </>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-
-            {ensemble === null && (
-              <p className="text-xs text-yellow-600 mt-3">
-                ⚠ Sin datos suficientes para calcular el ensemble.
-              </p>
-            )}
-
-            {/* ── ⭐ Bloque: Registrar operación ──────────────────────────── */}
-            {ensemble !== null && (
-              <div className="mt-6 border-t border-gray-800 pt-5">
-                <div className="flex flex-col sm:flex-row sm:items-end gap-4">
-                  <div className="flex-1">
-                    <h3 className="text-sm font-medium text-gray-300 mb-1">Registrar operación simulada</h3>
-                    <p className="text-xs text-gray-500">
-                      Se comprará <span className="text-white">ceil({ensemble}°) = {Math.ceil(ensemble)}°C</span> y{' '}
-                      <span className="text-white">{Math.ceil(ensemble) + 1}°C</span> con{' '}
-                      <span className="text-white">{stake / 2} USD cada token</span>.
-                      Guarda pesos {opt ? 'óptimos ' : ''}+ predicción + trades en la BBDD.
-                    </p>
-                  </div>
-
-                  {/* Stake input */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <label className="text-xs text-gray-400 whitespace-nowrap">Stake total</label>
-                    <div className="relative">
-                      <input
-                        type="number" min={1} max={1000} step={1}
-                        value={stake}
-                        onChange={e => setStake(Math.max(1, parseInt(e.target.value) || 20))}
-                        className="w-20 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5
-                                   text-white text-sm text-right focus:outline-none focus:border-blue-600"
-                      />
-                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 text-xs pointer-events-none">USD</span>
-                    </div>
-                  </div>
-
-                  {/* Botón registrar */}
-                  <button
-                    onClick={registerOperation}
-                    disabled={savingOp}
-                    className="shrink-0 px-5 py-2 rounded-lg bg-violet-600 hover:bg-violet-500
-                               disabled:opacity-50 text-white text-sm font-medium transition-colors
-                               flex items-center gap-2"
-                  >
-                    {savingOp ? (
-                      <><span className="animate-spin">⟳</span> Registrando…</>
-                    ) : (
-                      '⭐ Registrar operación'
-                    )}
-                  </button>
-                </div>
-
-                {/* Error al guardar */}
-                {saveOpError && (
-                  <div className="mt-3 bg-red-950 border border-red-800 rounded-lg px-4 py-2.5 text-red-400 text-xs">
-                    {saveOpError}
-                  </div>
-                )}
-
-                {/* ── Confirmación de operación guardada ─────────────────── */}
-                {savedOp && (
-                  <div className="mt-4 bg-violet-950/60 border border-violet-800 rounded-xl p-4">
-                    <div className="flex items-start justify-between mb-3">
-                      <div>
-                        <p className="text-sm font-medium text-violet-300">
-                          {savedOp.isUpdate ? '🔄 Operación actualizada' : '✅ Operación registrada'}
-                        </p>
-                        <p className="text-xs text-gray-500 mt-0.5">
-                          {fmtDate(savedOp.targetDate)} · Predicción ID: {savedOp.predictionId.substring(0, 8)}…
-                        </p>
-                      </div>
-                      <p className="text-lg font-bold text-white shrink-0">
-                        {savedOp.ensembleTemp}°C
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                      {/* Token A */}
-                      <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-xs text-gray-500 font-medium uppercase">Token A</span>
-                          <span className="text-xs text-violet-400 font-bold">
-                            {savedOp.tokenA.temp}°C
-                          </span>
-                        </div>
-                        <p className="text-[10px] text-gray-600 font-mono truncate mb-2">{savedOp.tokenA.slug}</p>
-                        <div className="grid grid-cols-3 gap-1 text-center">
-                          <div>
-                            <p className="text-[9px] text-gray-600">Coste</p>
-                            <p className="text-xs font-medium text-white">${savedOp.tokenA.cost}</p>
-                          </div>
-                          <div>
-                            <p className="text-[9px] text-gray-600">Precio</p>
-                            <p className="text-xs font-medium text-white">
-                              {savedOp.tokenA.price !== null
-                                ? savedOp.tokenA.price.toFixed(3)
-                                : <span className="text-gray-600">N/D</span>
-                              }
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-[9px] text-gray-600">Shares</p>
-                            <p className="text-xs font-medium text-white">
-                              {savedOp.tokenA.shares !== null
-                                ? savedOp.tokenA.shares.toFixed(2)
-                                : <span className="text-gray-600">N/D</span>
-                              }
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Token B */}
-                      <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-xs text-gray-500 font-medium uppercase">Token B</span>
-                          <span className="text-xs text-blue-400 font-bold">
-                            {savedOp.tokenB.temp}°C
-                          </span>
-                        </div>
-                        <p className="text-[10px] text-gray-600 font-mono truncate mb-2">{savedOp.tokenB.slug}</p>
-                        <div className="grid grid-cols-3 gap-1 text-center">
-                          <div>
-                            <p className="text-[9px] text-gray-600">Coste</p>
-                            <p className="text-xs font-medium text-white">${savedOp.tokenB.cost}</p>
-                          </div>
-                          <div>
-                            <p className="text-[9px] text-gray-600">Precio</p>
-                            <p className="text-xs font-medium text-white">
-                              {savedOp.tokenB.price !== null
-                                ? savedOp.tokenB.price.toFixed(3)
-                                : <span className="text-gray-600">N/D</span>
-                              }
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-[9px] text-gray-600">Shares</p>
-                            <p className="text-xs font-medium text-white">
-                              {savedOp.tokenB.shares !== null
-                                ? savedOp.tokenB.shares.toFixed(2)
-                                : <span className="text-gray-600">N/D</span>
-                              }
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 flex items-center justify-between text-xs text-gray-500">
-                      <span>
-                        Stake total: <span className="text-white font-medium">${savedOp.stake}</span>
-                        {' · '}Pesos {opt ? 'óptimos (MAE)' : 'actuales'} guardados en BD
-                      </span>
-                      <a href="/predictions"
-                        className="text-blue-400 hover:text-blue-300 transition-colors">
-                        Ver operaciones →
-                      </a>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
-        )
-      })()}
+          )}
+        </section>
+      )}
 
       {/* API Keys (colapsable) */}
       <section className="bg-gray-900 border border-gray-800 rounded-xl">
