@@ -42,8 +42,18 @@ export interface TrainingRun {
   notes: string
 }
 
+export interface TradeDetail {
+  position:     string        // 'a' | 'b' | 'low' | 'mid' | 'high'
+  token_temp:   number
+  price_at_buy: number | null
+  shares:       number | null
+  cost_usdc:    number
+  created_at:   string
+}
+
 export interface DailySummary {
-  target_date: string
+  target_date:  string
+  predicted_at: string | null  // hora de adquisición
   ensemble_temp: number
 
   // ── Modelo legacy (3 tokens) ───────────────────────────────────────────
@@ -61,6 +71,9 @@ export interface DailySummary {
 
   simulated:        boolean
 
+  // ── Trades (detalle de tokens adquiridos) ──────────────────────────────
+  trades: TradeDetail[] | null
+
   // ── Resultado (null si aún no resuelto) ────────────────────────────────
   actual_temp:      number | null
   won:              boolean | null
@@ -77,18 +90,16 @@ export async function getPerformance() {
 
 /**
  * Obtiene el resumen diario de predicciones consultando `predictions`
- * directamente (con join a `results`) para soportar tanto el modelo
- * legacy (token_low/mid/high) como el nuevo modelo de 2 tokens
- * (token_a / token_b).
- *
- * Ya NO depende de la vista `v_daily_summary`, que solo exponía columnas
- * legacy y dejaba en blanco los tokens/costes en predicciones nuevas.
+ * directamente (con join a `results` y `trades`) para soportar tanto el
+ * modelo legacy (token_low/mid/high) como el nuevo modelo de 2 tokens
+ * (token_a / token_b), e incluye el detalle de cada trade adquirido.
  */
 export async function getDailySummaries(limit = 30): Promise<DailySummary[] | null> {
   const { data, error } = await supabase
     .from('predictions')
     .select(`
       target_date,
+      predicted_at,
       ensemble_temp,
       token_low,
       token_mid,
@@ -104,6 +115,14 @@ export async function getDailySummaries(limit = 30): Promise<DailySummary[] | nu
         won,
         winning_position,
         pnl_net_usdc
+      ),
+      trades (
+        position,
+        token_temp,
+        price_at_buy,
+        shares,
+        cost_usdc,
+        created_at
       )
     `)
     .order('target_date', { ascending: false })
@@ -115,6 +134,14 @@ export async function getDailySummaries(limit = 30): Promise<DailySummary[] | nu
     // `results` es un array (relación 1-N); tomamos el primer resultado si existe
     const result = Array.isArray(row.results) ? row.results[0] ?? null : row.results ?? null
 
+    // `trades` ordenados por posición para display consistente
+    const trades: TradeDetail[] | null = Array.isArray(row.trades) && row.trades.length > 0
+      ? [...row.trades].sort((a: any, b: any) => {
+          const order: Record<string, number> = { low: 0, mid: 1, high: 2, a: 0, b: 1 }
+          return (order[a.position] ?? 99) - (order[b.position] ?? 99)
+        })
+      : null
+
     // total_cost_usdc: suma de los costes según el modelo disponible
     const total_cost_usdc =
       row.cost_a_usdc != null && row.cost_b_usdc != null
@@ -122,8 +149,9 @@ export async function getDailySummaries(limit = 30): Promise<DailySummary[] | nu
         : null
 
     return {
-      target_date:      row.target_date,
-      ensemble_temp:    row.ensemble_temp,
+      target_date:  row.target_date,
+      predicted_at: row.predicted_at ?? null,
+      ensemble_temp: row.ensemble_temp,
 
       // Legacy
       token_low:        row.token_low  ?? null,
@@ -139,6 +167,7 @@ export async function getDailySummaries(limit = 30): Promise<DailySummary[] | nu
       stake_usdc:  row.stake_usdc  ?? null,
 
       simulated:        row.simulated ?? false,
+      trades,
 
       // Resultado
       actual_temp:      result?.actual_temp      ?? null,
