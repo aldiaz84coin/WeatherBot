@@ -162,7 +162,7 @@ async function upsertWithCoalesce(incoming: HistoricalRecord[]): Promise<number>
     .upsert(merged, { onConflict: 'date' })
 
   if (error) {
-    console.warn('[comparison] Error en upsert:', error.message)
+    console.error('[comparison] Error en upsert:', JSON.stringify(error))
     return 0
   }
   return merged.length
@@ -430,12 +430,13 @@ async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
     const d = await res.json()
     const hours: any[] = d?.timelines?.hourly ?? []
     // Filtrar horas del día objetivo (comparando solo YYYY-MM-DD del timestamp)
+    // Nota: en timesteps=1h el campo es values.temperature, no values.temperatureMax
     const dayTemps = hours
       .filter((h: any) => {
         const hDate = (h.time as string)?.substring(0, 10)
         return hDate === date
       })
-      .map((h: any) => h.values?.temperature as number)
+      .map((h: any) => (h.values?.temperature ?? h.values?.temperatureMax) as number)
       .filter((t): t is number => t != null)
     if (!dayTemps.length) throw new Error('Fecha no encontrada')
     return { tmax: Math.round(Math.max(...dayTemps) * 10) / 10, err: null }
