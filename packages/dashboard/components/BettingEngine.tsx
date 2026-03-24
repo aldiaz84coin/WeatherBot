@@ -159,7 +159,7 @@ export function BettingEngine() {
   }
 
   const bar = multiplierBar(
-    status?.current_multiplier,
+    status?.current_multiplier ?? null,
     status?.max_stake && status?.base_stake ? status.max_stake / status.base_stake : null,
     1
   )
