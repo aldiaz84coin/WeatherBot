@@ -98,8 +98,9 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   let ensembleTemp: number
 
   try {
-    sourceTemps   = await manager.fetchAll(tomorrow)
-    ensembleTemp  = manager.computeEnsemble(sourceTemps)
+    const forecast = await manager.getEnsembleForecast(tomorrow)
+    sourceTemps    = forecast.sourceTemps
+    ensembleTemp   = forecast.ensembleTemp
   } catch (err) {
     await logger.error(`Error obteniendo predicciones de fuentes`, err)
     // Registrar ciclo con error y abortar
@@ -127,7 +128,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   let position: Awaited<ReturnType<typeof buildPosition>>
 
   try {
-    position = await buildPosition(ensembleTemp, tomorrow, stake.currentStake)
+    position = await buildPosition(ensembleTemp, tomorrow)
   } catch (err) {
     await logger.error(`Error construyendo posición`, err)
     await supabase.from('betting_cycles').insert({
