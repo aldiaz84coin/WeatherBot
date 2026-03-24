@@ -19,6 +19,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <a href="/comparison" className="text-sm text-gray-400 hover:text-white transition-colors">
             📊 Comparativa
           </a>
+          <a href="/betting"    className="text-sm text-gray-400 hover:text-white transition-colors">
+            🎯 Apuestas
+          </a>
           <a href="/config"     className="text-sm text-gray-400 hover:text-white transition-colors">
             ⚙️ Configuración
           </a>
