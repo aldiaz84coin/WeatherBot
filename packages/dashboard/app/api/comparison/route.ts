@@ -98,15 +98,84 @@ function isPast(date: string): boolean {
   return date < today
 }
 
-// ─── ⭐ Persistencia histórica ─────────────────────────────────────────────────
+// ─── ⭐ Persistencia histórica y forecast ─────────────────────────────────────
+//
+// Estrategia COALESCE: nunca sobreescribir un valor existente no-null.
+// Solo rellenar huecos. Así el histórico real tiene prioridad sobre cualquier
+// forecast previo, y un forecast no machaca otro forecast ya guardado.
+//
+// Flujo por fila:
+//   1. SELECT existing row for date
+//   2. Merge: existing[col] ?? incoming[col]
+//   3. UPSERT merged result
 
+type HistoricalRecord = {
+  date: string
+  polymarket_temp?: number | null
+  polymarket_resolved?: boolean
+  open_meteo_tmax?: number | null
+  aemet_tmax?: number | null
+  visual_crossing_tmax?: number | null
+  weatherapi_tmax?: number | null
+  openweather_tmax?: number | null
+  tomorrow_tmax?: number | null
+  accuweather_tmax?: number | null
+  updated_at: string
+}
+
+async function upsertWithCoalesce(incoming: HistoricalRecord[]): Promise<number> {
+  if (!incoming.length) return 0
+  const supabase = getSupabase()
+
+  const dates = incoming.map(r => r.date)
+
+  // 1. Leer filas existentes de una vez
+  const { data: existing } = await supabase
+    .from('historical_temperature_data')
+    .select('*')
+    .in('date', dates)
+
+  const existingMap: Record<string, any> = {}
+  for (const row of existing ?? []) existingMap[row.date] = row
+
+  // 2. Merge: los valores existentes no-null tienen prioridad
+  const merged: HistoricalRecord[] = incoming.map(inc => {
+    const ex = existingMap[inc.date] ?? {}
+    return {
+      date:                 inc.date,
+      polymarket_temp:      ex.polymarket_temp      ?? inc.polymarket_temp      ?? null,
+      polymarket_resolved:  ex.polymarket_resolved  ?? inc.polymarket_resolved  ?? false,
+      open_meteo_tmax:      ex.open_meteo_tmax      ?? inc.open_meteo_tmax      ?? null,
+      aemet_tmax:           ex.aemet_tmax           ?? inc.aemet_tmax           ?? null,
+      visual_crossing_tmax: ex.visual_crossing_tmax ?? inc.visual_crossing_tmax ?? null,
+      weatherapi_tmax:      ex.weatherapi_tmax      ?? inc.weatherapi_tmax      ?? null,
+      openweather_tmax:     ex.openweather_tmax     ?? inc.openweather_tmax     ?? null,
+      tomorrow_tmax:        ex.tomorrow_tmax        ?? inc.tomorrow_tmax        ?? null,
+      accuweather_tmax:     ex.accuweather_tmax     ?? inc.accuweather_tmax     ?? null,
+      updated_at:           new Date().toISOString(),
+    }
+  })
+
+  // 3. Upsert con los datos fusionados
+  const { error } = await supabase
+    .from('historical_temperature_data')
+    .upsert(merged, { onConflict: 'date' })
+
+  if (error) {
+    console.warn('[comparison] Error en upsert:', error.message)
+    return 0
+  }
+  return merged.length
+}
+
+// Guarda los 8 días históricos — solo filas resueltas por Polymarket
 async function saveHistoricalData(rows: DayRow[]): Promise<number> {
   const resolvedRows = rows.filter(
     r => r.polymarket.resolved && r.polymarket.temp !== null
   )
-  if (resolvedRows.length === 0) return 0
+  if (!resolvedRows.length) return 0
 
-  const records = resolvedRows.map(row => ({
+  const records: HistoricalRecord[] = resolvedRows.map(row => ({
     date:                 row.date,
     polymarket_temp:      row.polymarket.temp,
     polymarket_resolved:  true,
@@ -120,18 +189,31 @@ async function saveHistoricalData(rows: DayRow[]): Promise<number> {
     updated_at:           new Date().toISOString(),
   }))
 
-  const supabase = getSupabase()
-  const { error } = await supabase
-    .from('historical_temperature_data')
-    .upsert(records, { onConflict: 'date' })
+  const saved = await upsertWithCoalesce(records)
+  console.log(`[comparison] ✅ ${saved} registro(s) histórico(s) guardados`)
+  return saved
+}
 
-  if (error) {
-    console.warn('[comparison] Error guardando histórico:', error.message)
-    return 0
+// Guarda el forecast de mañana — todas las fuentes que hayan respondido
+// Cuando llegue el día real, saveHistoricalData rellenará polymarket_temp
+// y sobreescribirá solo los campos que estaban a null (COALESCE).
+async function saveForecastData(tomorrow: TomorrowSources): Promise<void> {
+  const record: HistoricalRecord = {
+    date:                 tomorrow.date,
+    polymarket_temp:      null,           // aún no resuelto
+    polymarket_resolved:  false,
+    open_meteo_tmax:      tomorrow.sources.open_meteo.tmax      ?? null,
+    aemet_tmax:           tomorrow.sources.aemet.tmax            ?? null,
+    visual_crossing_tmax: tomorrow.sources.visual_crossing.tmax  ?? null,
+    weatherapi_tmax:      tomorrow.sources.weatherapi.tmax       ?? null,
+    openweather_tmax:     tomorrow.sources.openweather.tmax      ?? null,
+    tomorrow_tmax:        tomorrow.sources.tomorrow.tmax         ?? null,
+    accuweather_tmax:     tomorrow.sources.accuweather.tmax      ?? null,
+    updated_at:           new Date().toISOString(),
   }
 
-  console.log(`[comparison] ✅ ${records.length} registro(s) histórico(s) guardados`)
-  return records.length
+  const saved = await upsertWithCoalesce([record])
+  console.log(`[comparison] ✅ Forecast de ${tomorrow.date} guardado (${saved} fila)`)
 }
 
 // ─── Polymarket ───────────────────────────────────────────────────────────────
@@ -297,15 +379,15 @@ async function fetchAemet(date: string, key: string): Promise<SourceResult> {
 }
 
 // ─── OpenWeather ──────────────────────────────────────────────────────────────
-// Histórico: proxy Open-Meteo Archive (OWM historical requiere plan de pago)
+// Histórico: null — OWM historical requiere plan de pago.
+//            Guardar proxy Open-Meteo contaminaría el dataset (datos duplicados).
 // Forecast:  /data/2.5/forecast — gratuito (3h blocks, 5 días)
 
 async function fetchOpenWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
 
   if (isPast(date)) {
-    // OWM historical requiere plan de pago → proxy Open-Meteo Archive
-    return fetchOpenMeteoArchive(date)
+    return { tmax: null, err: 'Sin API histórica en free tier' }
   }
 
   // Forecast gratuito: /data/2.5/forecast devuelve bloques de 3h
@@ -328,14 +410,15 @@ async function fetchOpenWeather(date: string, key: string): Promise<SourceResult
 }
 
 // ─── Tomorrow.io ──────────────────────────────────────────────────────────────
-// Histórico: proxy Open-Meteo Archive (Tomorrow no tiene histórico en free tier)
+// Histórico: null — Tomorrow no tiene histórico en free tier.
+//            Guardar proxy Open-Meteo contaminaría el dataset (datos duplicados).
 // Forecast:  endpoint estándar
 
 async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
 
   if (isPast(date)) {
-    return fetchOpenMeteoArchive(date)
+    return { tmax: null, err: 'Sin API histórica en free tier' }
   }
 
   try {
@@ -407,14 +490,15 @@ async function fetchWeatherApiForecast(date: string, key: string): Promise<Sourc
 }
 
 // ─── AccuWeather ──────────────────────────────────────────────────────────────
-// Histórico: proxy Open-Meteo Archive (AccuWeather no tiene histórico free)
+// Histórico: null — AccuWeather no tiene histórico free.
+//            Guardar proxy Open-Meteo contaminaría el dataset (datos duplicados).
 // Forecast:  5-day endpoint estándar
 
 async function fetchAccuWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
 
   if (isPast(date)) {
-    return fetchOpenMeteoArchive(date)
+    return { tmax: null, err: 'Sin API histórica en free tier' }
   }
 
   try {
@@ -511,6 +595,12 @@ export async function POST(req: NextRequest) {
         open_meteo:      tmrOpenMeteo,
       },
     }
+
+    // ── ⭐ Guardar forecast de mañana ──────────────────────────────────────────
+    // Fire-and-forget. COALESCE: no sobreescribe fuentes ya guardadas hoy.
+    saveForecastData(tomorrowSources).catch(e =>
+      console.warn("[comparison] Error guardando forecast:", e?.message)
+    )
 
     const response: ComparisonResponse = {
       rows,
