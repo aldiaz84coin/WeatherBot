@@ -12,7 +12,6 @@ const ACCUWEATHER_LOCATION_KEY = '308526'
 const GAMMA_BASE = 'https://gamma-api.polymarket.com'
 
 // ─── Cliente Supabase para escritura (service key) ────────────────────────────
-// Solo se usa en saveHistoricalData; el resto de la ruta no toca la BD.
 function getSupabase() {
   return createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -63,7 +62,7 @@ export interface ComparisonResponse {
   rows: DayRow[]
   keysConfigured: Record<string, boolean>
   tomorrowSources?: TomorrowSources
-  historicalSaved?: number   // cuántos registros se guardaron/actualizaron
+  historicalSaved?: number
 }
 
 // ─── Helpers de slug / fecha ──────────────────────────────────────────────────
@@ -93,9 +92,13 @@ function getTomorrowDate(): string {
   return d.toISOString().split('T')[0]
 }
 
+/** Devuelve true si la fecha es anterior a hoy */
+function isPast(date: string): boolean {
+  const today = new Date().toISOString().split('T')[0]
+  return date < today
+}
+
 // ─── ⭐ Persistencia histórica ─────────────────────────────────────────────────
-// Guarda en Supabase todos los días que Polymarket ya tiene resueltos.
-// Fire-and-forget: no bloquea la respuesta al usuario.
 
 async function saveHistoricalData(rows: DayRow[]): Promise<number> {
   const resolvedRows = rows.filter(
@@ -196,9 +199,10 @@ async function fetchPolymarket(date: string): Promise<DayRow['polymarket']> {
   }
 }
 
-// ─── Open-Meteo histórico ─────────────────────────────────────────────────────
+// ─── Open-Meteo Archive (proxy histórico compartido) ──────────────────────────
+// Usado como fallback para fuentes sin API histórica gratuita.
 
-async function fetchOpenMeteo(date: string): Promise<SourceResult> {
+async function fetchOpenMeteoArchive(date: string): Promise<SourceResult> {
   try {
     const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${MADRID_LAT}&longitude=${MADRID_LON}&daily=temperature_2m_max&timezone=Europe%2FMadrid&start_date=${date}&end_date=${date}`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
@@ -232,10 +236,44 @@ async function fetchOpenMeteoForecast(date: string): Promise<SourceResult> {
   }
 }
 
+// Alias para el handler (las rows usan el archive, tomorrow usa el forecast)
+async function fetchOpenMeteo(date: string): Promise<SourceResult> {
+  return fetchOpenMeteoArchive(date)
+}
+
 // ─── AEMET ────────────────────────────────────────────────────────────────────
+// Histórico: endpoint climatológico (estación Retiro 3195) — devuelve datos reales
+// Forecast:  endpoint predicción municipal (28079) — devuelve hasta 7 días vista
 
 async function fetchAemet(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
+
+  if (isPast(date)) {
+    // ── Climatológico diario ──────────────────────────────────────────────────
+    // Nota: AEMET tiene 1-2 días de retraso. Si falla, proxy Open-Meteo.
+    try {
+      const metaUrl = `https://opendata.aemet.es/opendata/api/valores/climatologicos/diarios/datos/fechaini/${date}T00:00:00UTC/fechafin/${date}T23:59:59UTC/estacion/3195/?api_key=${key}`
+      const res1 = await fetch(metaUrl, { signal: AbortSignal.timeout(10_000) })
+      if (!res1.ok) throw new Error(`HTTP ${res1.status}`)
+      const meta = await res1.json()
+      if (meta.estado !== 200) throw new Error(meta.descripcion ?? 'Error AEMET')
+      const res2 = await fetch(meta.datos, { signal: AbortSignal.timeout(10_000) })
+      if (!res2.ok) throw new Error(`HTTP ${res2.status}`)
+      const data = await res2.json()
+      const record = data?.[0]
+      if (!record?.tmax) throw new Error('Campo tmax ausente')
+      // AEMET usa coma como decimal en datos históricos
+      const tmax = parseFloat(record.tmax.replace(',', '.'))
+      if (isNaN(tmax)) throw new Error(`tmax no numérico: ${record.tmax}`)
+      return { tmax, err: null }
+    } catch (e: any) {
+      // Fallback: Open-Meteo Archive
+      console.warn(`[comparison] AEMET climatológico falló para ${date}: ${e.message} — usando Open-Meteo`)
+      return fetchOpenMeteoArchive(date)
+    }
+  }
+
+  // ── Predicción municipal (forecast) ──────────────────────────────────────────
   try {
     const res1 = await fetch(
       `https://opendata.aemet.es/opendata/api/prediccion/especifica/municipio/diaria/28079/?api_key=${key}`,
@@ -259,32 +297,47 @@ async function fetchAemet(date: string, key: string): Promise<SourceResult> {
 }
 
 // ─── OpenWeather ──────────────────────────────────────────────────────────────
+// Histórico: proxy Open-Meteo Archive (OWM historical requiere plan de pago)
+// Forecast:  /data/2.5/forecast — gratuito (3h blocks, 5 días)
 
 async function fetchOpenWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
+
+  if (isPast(date)) {
+    // OWM historical requiere plan de pago → proxy Open-Meteo Archive
+    return fetchOpenMeteoArchive(date)
+  }
+
+  // Forecast gratuito: /data/2.5/forecast devuelve bloques de 3h
+  // /data/2.5/forecast/daily requiere plan de pago → no usar
   try {
-    const url = `https://api.openweathermap.org/data/2.5/forecast/daily?q=${encodeURIComponent(MADRID_QUERY)}&cnt=5&units=metric&appid=${key}`
+    const url = `https://api.openweathermap.org/data/2.5/forecast?lat=${MADRID_LAT}&lon=${MADRID_LON}&appid=${key}&units=metric&cnt=40`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const d = await res.json()
     const list: any[] = d?.list ?? []
-    const target = list.find(item => {
-      const dt = new Date(item.dt * 1000).toISOString().split('T')[0]
-      return dt === date
-    })
-    if (!target) throw new Error('Fecha no encontrada')
-    const tmax = target?.temp?.max
-    if (tmax == null) throw new Error('Sin tmax')
-    return { tmax: Math.round(tmax * 10) / 10, err: null }
+    // Filtrar bloques del día objetivo y sacar el máximo
+    const temps = list
+      .filter((item: any) => (item.dt_txt as string).startsWith(date))
+      .map((item: any) => item.main.temp_max as number)
+    if (!temps.length) throw new Error('Fecha no encontrada')
+    return { tmax: Math.round(Math.max(...temps) * 10) / 10, err: null }
   } catch (e: any) {
     return { tmax: null, err: e.message?.substring(0, 60) }
   }
 }
 
 // ─── Tomorrow.io ──────────────────────────────────────────────────────────────
+// Histórico: proxy Open-Meteo Archive (Tomorrow no tiene histórico en free tier)
+// Forecast:  endpoint estándar
 
 async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
+
+  if (isPast(date)) {
+    return fetchOpenMeteoArchive(date)
+  }
+
   try {
     const url = `https://api.tomorrow.io/v4/weather/forecast?location=${MADRID_LAT},${MADRID_LON}&timesteps=1d&apikey=${key}`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
@@ -302,6 +355,7 @@ async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
 }
 
 // ─── Visual Crossing ──────────────────────────────────────────────────────────
+// Soporta tanto histórico como forecast con el mismo endpoint timeline
 
 async function fetchVisualCrossing(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
@@ -353,9 +407,16 @@ async function fetchWeatherApiForecast(date: string, key: string): Promise<Sourc
 }
 
 // ─── AccuWeather ──────────────────────────────────────────────────────────────
+// Histórico: proxy Open-Meteo Archive (AccuWeather no tiene histórico free)
+// Forecast:  5-day endpoint estándar
 
 async function fetchAccuWeather(date: string, key: string): Promise<SourceResult> {
   if (!key) return { tmax: null, err: 'Sin API key' }
+
+  if (isPast(date)) {
+    return fetchOpenMeteoArchive(date)
+  }
+
   try {
     const url = `https://dataservice.accuweather.com/forecasts/v1/daily/5day/${ACCUWEATHER_LOCATION_KEY}?apikey=${key}&metric=true&details=false`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
@@ -387,7 +448,7 @@ export async function POST(req: NextRequest) {
       aemet:           keyOverrides.aemet            ?? process.env.AEMET_API_KEY          ?? '',
       openweather:     keyOverrides.openweather       ?? process.env.OPENWEATHER_API_KEY    ?? '',
       tomorrow:        keyOverrides.tomorrow          ?? process.env.TOMORROW_IO_KEY        ?? '',
-      visual_crossing: keyOverrides.visual_crossing   ?? process.env.VISUAL_CROSSING_KEY   ?? '',
+      visual_crossing: keyOverrides.visual_crossing   ?? process.env.VISUAL_CROSSING_KEY    ?? '',
       weatherapi:      keyOverrides.weatherapi        ?? process.env.WEATHERAPI_KEY         ?? '',
       accuweather:     keyOverrides.accuweather       ?? process.env.ACCUWEATHER_API_KEY    ?? '',
     }
@@ -396,7 +457,7 @@ export async function POST(req: NextRequest) {
       Object.entries(keys).map(([k, v]) => [k, v.length > 0])
     )
 
-    // ── Fetch en paralelo — datos históricos ──────────────────────────────────
+    // ── Fetch en paralelo — datos históricos (últimos 8 días) ─────────────────
     const rows: DayRow[] = await Promise.all(
       dates.map(async (date): Promise<DayRow> => {
         const [polymarket, aemet, openweather, tomorrow, visual_crossing, weatherapi, accuweather, open_meteo] =
