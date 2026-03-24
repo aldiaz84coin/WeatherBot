@@ -422,16 +422,23 @@ async function fetchTomorrow(date: string, key: string): Promise<SourceResult> {
   }
 
   try {
-    const url = `https://api.tomorrow.io/v4/weather/forecast?location=${MADRID_LAT},${MADRID_LON}&timesteps=1d&apikey=${key}`
+    // Usamos timesteps horario: más robusto en free tier y evita problemas
+    // de timezone en timestamps diarios de Tomorrow.io
+    const url = `https://api.tomorrow.io/v4/weather/forecast?location=${MADRID_LAT},${MADRID_LON}&timesteps=1h&apikey=${key}&units=metric`
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const d = await res.json()
-    const days: any[] = d?.timelines?.daily ?? []
-    const target = days.find(item => item.time?.startsWith(date))
-    if (!target) throw new Error('Fecha no encontrada')
-    const tmax = target?.values?.temperatureMax
-    if (tmax == null) throw new Error('Sin tmax')
-    return { tmax: Math.round(tmax * 10) / 10, err: null }
+    const hours: any[] = d?.timelines?.hourly ?? []
+    // Filtrar horas del día objetivo (comparando solo YYYY-MM-DD del timestamp)
+    const dayTemps = hours
+      .filter((h: any) => {
+        const hDate = (h.time as string)?.substring(0, 10)
+        return hDate === date
+      })
+      .map((h: any) => h.values?.temperature as number)
+      .filter((t): t is number => t != null)
+    if (!dayTemps.length) throw new Error('Fecha no encontrada')
+    return { tmax: Math.round(Math.max(...dayTemps) * 10) / 10, err: null }
   } catch (e: any) {
     return { tmax: null, err: e.message?.substring(0, 60) }
   }
@@ -597,8 +604,9 @@ export async function POST(req: NextRequest) {
     }
 
     // ── ⭐ Guardar forecast de mañana ──────────────────────────────────────────
-    // Fire-and-forget. COALESCE: no sobreescribe fuentes ya guardadas hoy.
-    saveForecastData(tomorrowSources).catch(e =>
+    // Awaited: en serverless (Vercel) el fire-and-forget muere antes de resolver.
+    // COALESCE: no sobreescribe fuentes ya guardadas hoy.
+    await saveForecastData(tomorrowSources).catch(e =>
       console.warn("[comparison] Error guardando forecast:", e?.message)
     )
 
