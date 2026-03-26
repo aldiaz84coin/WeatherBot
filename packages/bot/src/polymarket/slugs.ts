@@ -1,26 +1,25 @@
 // src/polymarket/slugs.ts
 // Generador de slugs para los mercados diarios de temperatura en Madrid
-// Formato: highest-temperature-in-madrid-on-march-21-2026
+//
+// Formato confirmado (igual que el dashboard):
+//   Evento del día: highest-temperature-in-madrid-on-march-27-2026
+//
+// El bot NO construye slugs de tokens individuales para buscarlos directamente.
+// En su lugar usa el day slug con /events y extrae los sub-mercados del resultado,
+// igual que hace el dashboard en /api/markets.
 
 import { format } from 'date-fns'
 
-// Slug del mercado del día (sin temperatura específica)
+// Slug del evento del día (sin temperatura específica)
+// Ejemplo: "highest-temperature-in-madrid-on-march-27-2026"
 export function buildDaySlug(date: Date | string): string {
   const d = typeof date === 'string' ? new Date(date + 'T12:00:00') : date
   return `highest-temperature-in-madrid-on-${format(d, 'MMMM-d-yyyy').toLowerCase()}`
 }
 
-// Slug de un token específico de temperatura
-// Ejemplo: highest-temperature-in-madrid-36c-on-march-21-2026
-export function buildTokenSlug(date: Date | string, tempCelsius: number): string {
-  const d = typeof date === 'string' ? new Date(date + 'T12:00:00') : date
-  const tempRounded = Math.round(tempCelsius)
-  return `highest-temperature-in-madrid-${tempRounded}c-on-${format(d, 'MMMM-d-yyyy').toLowerCase()}`
-}
-
 // Parsea la fecha del slug para verificación
 export function parseDateFromSlug(slug: string): string | null {
-  const match = slug.match(/on-(\w+)-(\d+)-(\d{4})$/)
+  const match = slug.match(/on-(\w+)-(\d+)-(\d{4})/)
   if (!match) return null
   const [, month, day, year] = match
   try {
