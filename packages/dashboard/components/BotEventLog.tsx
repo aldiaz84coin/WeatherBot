@@ -2,10 +2,18 @@
 // packages/dashboard/components/BotEventLog.tsx
 // ──────────────────────────────────────────────────────────────────────────────
 // Feed en tiempo real de eventos del bot.
-// Consume bot_events vía Supabase Realtime.
+// Consume bot_events vía Supabase Realtime + polling de respaldo cada 30s.
+//
+// CORRECCIONES:
+//  1. autoScroll → topRef (eventos nuevos se prependen, scroll al TOP)
+//  2. Race condition → Realtime dispara reload() en vez de patch parcial
+//  3. Polling de respaldo → setInterval 30s por si Realtime no está activo
+//  4. Payload Realtime → re-fetch desde v_bot_events_recent para obtener
+//     cycle_date / cycle_stake del JOIN (el payload base no los trae)
+//  5. cycle_status añadido al tipo BotEvent
 // ──────────────────────────────────────────────────────────────────────────────
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { createClient } from '@supabase/supabase-js'
 import { format, parseISO } from 'date-fns'
 import { es } from 'date-fns/locale'
@@ -21,14 +29,15 @@ type Severity  = 'info' | 'warn' | 'error' | 'success'
 type EventType = string
 
 interface BotEvent {
-  id:          string
-  occurred_at: string
-  event_type:  EventType
-  severity:    Severity
-  message:     string
-  payload:     Record<string, unknown> | null
-  cycle_date:  string | null
-  cycle_stake: number | null
+  id:           string
+  occurred_at:  string
+  event_type:   EventType
+  severity:     Severity
+  message:      string
+  payload:      Record<string, unknown> | null
+  cycle_date:   string | null
+  cycle_stake:  number | null
+  cycle_status: string | null   // FIX #5: campo que ya devuelve la vista
 }
 
 // ─── Helpers visuales ─────────────────────────────────────────────────────────
@@ -70,8 +79,8 @@ const EVENT_LABELS: Record<string, string> = {
 // ─── Componente ───────────────────────────────────────────────────────────────
 
 interface Props {
-  limit?:      number
-  autoScroll?: boolean
+  limit?:          number
+  autoScroll?:     boolean
   filterSeverity?: Severity | 'all'
 }
 
@@ -81,45 +90,65 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
   const [severity, setSeverity]   = useState<Severity | 'all'>(filterSeverity)
   const [expanded, setExpanded]   = useState<Set<string>>(new Set())
   const [connected, setConnected] = useState(false)
-  const bottomRef                 = useRef<HTMLDivElement>(null)
 
-  // ── Carga inicial ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true)
-      let q = supabase
-        .from('v_bot_events_recent')
-        .select('*')
-        .order('occurred_at', { ascending: false })
-        .limit(limit)
+  // FIX #1: topRef en lugar de bottomRef — los eventos nuevos van ARRIBA
+  const topRef = useRef<HTMLDivElement>(null)
 
-      if (severity !== 'all') q = q.eq('severity', severity)
+  // ── Carga desde la vista (incluye cycle_date, cycle_stake, cycle_status) ──
+  // FIX #2 + #4: esta función es la única fuente de verdad.
+  // El handler de Realtime la llama en vez de parchear el estado con payload
+  // incompleto (el payload base no trae los campos JOIN de la vista).
+  const load = useCallback(async () => {
+    let q = supabase
+      .from('v_bot_events_recent')
+      .select('*')
+      .order('occurred_at', { ascending: false })
+      .limit(limit)
 
-      const { data } = await q
+    if (severity !== 'all') q = q.eq('severity', severity)
+
+    const { data, error } = await q
+    if (!error) {
       setEvents(data ?? [])
-      setLoading(false)
     }
-    load()
+    setLoading(false)
   }, [severity, limit])
 
+  // ── Carga inicial + polling de respaldo cada 30s ───────────────────────────
+  // FIX #3: si Realtime no está habilitado en el proyecto Supabase, el log
+  // se refresca igualmente cada 30s.
+  useEffect(() => {
+    setLoading(true)
+    load()
+
+    const interval = setInterval(load, 30_000)
+    return () => clearInterval(interval)
+  }, [load])
+
   // ── Realtime subscription ──────────────────────────────────────────────────
+  // FIX #2 + #4: en vez de añadir el payload crudo (que no tiene cycle_date
+  // ni cycle_stake), hacemos un reload completo desde la vista.
+  // Esto también elimina la race condition con la carga inicial.
   useEffect(() => {
     const channel = supabase
       .channel('bot-events-live')
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'bot_events' },
-        (payload) => {
-          const newEvent = payload.new as BotEvent
-          // Filtrar por severity si aplica
-          if (severity !== 'all' && newEvent.severity !== severity) return
+        async (payload) => {
+          const newRaw = payload.new as { severity: Severity }
 
-          setEvents(prev => [newEvent, ...prev].slice(0, limit))
+          // Filtro rápido de severity antes del refetch
+          if (severity !== 'all' && newRaw.severity !== severity) return
 
+          // Reload desde la vista para obtener todos los campos (cycle_date, etc.)
+          await load()
+
+          // FIX #1: scroll al top (eventos nuevos están en la parte superior)
           if (autoScroll) {
             setTimeout(() => {
-              bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-            }, 100)
+              topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+            }, 150)
           }
         }
       )
@@ -128,7 +157,7 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
       })
 
     return () => { supabase.removeChannel(channel) }
-  }, [severity, limit, autoScroll])
+  }, [severity, limit, autoScroll, load])
 
   // ── Toggle payload expandido ───────────────────────────────────────────────
   const toggleExpand = (id: string) => {
@@ -150,9 +179,16 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
             Log del Bot
           </p>
           {/* Indicador de conexión Realtime */}
-          <span className={`inline-block w-1.5 h-1.5 rounded-full ${
-            connected ? 'bg-green-500 animate-pulse' : 'bg-gray-600'
-          }`} title={connected ? 'Realtime conectado' : 'Sin conexión Realtime'} />
+          <span
+            className={`inline-block w-1.5 h-1.5 rounded-full ${
+              connected ? 'bg-green-500 animate-pulse' : 'bg-gray-600'
+            }`}
+            title={connected ? 'Realtime conectado' : 'Sin conexión Realtime (polling cada 30s)'}
+          />
+          {/* Label conexión */}
+          <span className="text-[10px] text-gray-600">
+            {connected ? 'live' : 'polling'}
+          </span>
         </div>
 
         {/* Filtro de severity */}
@@ -167,7 +203,7 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
                   : 'border-gray-800 text-gray-600 hover:text-gray-400'
               }`}
             >
-              {s === 'all' ? 'Todos'
+              {s === 'all'     ? 'Todos'
                : s === 'success' ? '✅'
                : s === 'warn'    ? '🟡'
                : s === 'error'   ? '🔴'
@@ -179,6 +215,10 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
 
       {/* Lista de eventos */}
       <div className="divide-y divide-gray-800/50 max-h-[480px] overflow-y-auto">
+
+        {/* FIX #1: anchor al TOP para autoScroll correcto */}
+        <div ref={topRef} />
+
         {loading ? (
           <div className="flex items-center justify-center py-8 gap-2 text-gray-600 text-sm">
             <div className="w-4 h-4 border-2 border-gray-700 border-t-blue-500 rounded-full animate-spin" />
@@ -187,7 +227,10 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
         ) : events.length === 0 ? (
           <div className="py-8 text-center text-gray-600 text-sm">
             <p className="text-2xl mb-2">📭</p>
-            Sin eventos registrados
+            <p>Sin eventos registrados</p>
+            <p className="text-xs text-gray-700 mt-1">
+              El bot registrará eventos en bot_events cuando arranque.
+            </p>
           </div>
         ) : (
           events.map(ev => {
@@ -207,18 +250,29 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
 
                   {/* Contenido */}
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-0.5">
+                    <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                       {/* Tipo de evento */}
                       <span className="text-gray-500 shrink-0">
                         {EVENT_LABELS[ev.event_type] ?? ev.event_type}
                       </span>
-                      {/* Fecha del ciclo */}
+                      {/* Fecha del ciclo (viene del JOIN de la vista) */}
                       {ev.cycle_date && (
                         <span className="text-gray-600">· {ev.cycle_date}</span>
                       )}
                       {/* Stake del ciclo */}
                       {ev.cycle_stake != null && (
                         <span className="text-gray-700">· {ev.cycle_stake} USDC</span>
+                      )}
+                      {/* Estado del ciclo */}
+                      {ev.cycle_status && (
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                          ev.cycle_status === 'won'  ? 'text-green-400 border-green-900 bg-green-950/40' :
+                          ev.cycle_status === 'lost' ? 'text-red-400 border-red-900 bg-red-950/40' :
+                          ev.cycle_status === 'open' ? 'text-blue-400 border-blue-900 bg-blue-950/40' :
+                          'text-gray-500 border-gray-800'
+                        }`}>
+                          {ev.cycle_status}
+                        </span>
                       )}
                     </div>
 
@@ -256,7 +310,6 @@ export function BotEventLog({ limit = 50, autoScroll = true, filterSeverity = 'a
             )
           })
         )}
-        <div ref={bottomRef} />
       </div>
     </section>
   )

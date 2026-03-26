@@ -3,6 +3,10 @@
 // ──────────────────────────────────────────────────────────────────────────────
 // Panel completo del Motor de Apuestas Martingala.
 // Muestra: estado actual, stake, ciclos históricos y configuración.
+//
+// CORRECCIÓN:
+//  5. Estado vacío informativo cuando v_betting_status devuelve 0 filas
+//     (betting_cycles vacía → status=null no renderizaba nada sin explicación)
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { useEffect, useState, useCallback } from 'react'
@@ -47,17 +51,17 @@ interface BettingStatus {
 }
 
 interface BettingCycle {
-  id:              string
-  target_date:     string
-  stake_usdc:      number
-  multiplier:      number
-  token_a_temp:    number
-  token_b_temp:    number
-  actual_temp:     number | null
-  status:          string
-  pnl_usdc:        number | null
-  simulated:       boolean
-  capped_at_max:   boolean
+  id:            string
+  target_date:   string
+  stake_usdc:    number
+  multiplier:    number
+  token_a_temp:  number
+  token_b_temp:  number
+  actual_temp:   number | null
+  status:        string
+  pnl_usdc:      number | null
+  simulated:     boolean
+  capped_at_max: boolean
 }
 
 // ─── Helpers de estilo ────────────────────────────────────────────────────────
@@ -91,9 +95,36 @@ function pnlColor(pnl: number | null) {
 
 function multiplierBar(mult: number | null, max: number | null, base: number | null) {
   if (!mult || !max || !base) return null
-  const pct = Math.min((Math.log2(mult) / Math.log2(max / base)) * 100, 100)
+  const pct   = Math.min((Math.log2(mult) / Math.log2(max / base)) * 100, 100)
   const color = pct >= 80 ? 'bg-red-500' : pct >= 50 ? 'bg-yellow-500' : 'bg-blue-500'
   return { pct, color }
+}
+
+// ─── Empty state — primer ciclo todavía no ejecutado ─────────────────────────
+// FIX #5: antes este bloque no existía y la sección de KPIs simplemente
+// no renderizaba nada cuando betting_cycles estaba vacía, sin explicación.
+
+function NoDataState() {
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 flex flex-col items-center justify-center text-center gap-3">
+      <span className="text-3xl">🎯</span>
+      <div>
+        <p className="text-gray-300 font-medium text-sm">Sin ciclos registrados</p>
+        <p className="text-gray-600 text-xs mt-1 max-w-xs">
+          El motor ejecutará el primer ciclo a las <span className="text-gray-400">00:30 (Madrid)</span>.
+          Mientras tanto puedes revisar la configuración en{' '}
+          <span className="text-gray-400">bot_config</span>.
+        </p>
+      </div>
+      <div className="flex gap-4 text-xs text-gray-700 mt-1">
+        <span>base_stake_usdc</span>
+        <span>·</span>
+        <span>max_stake_usdc</span>
+        <span>·</span>
+        <span>betting_mode</span>
+      </div>
+    </div>
+  )
 }
 
 // ─── Componente principal ─────────────────────────────────────────────────────
@@ -105,16 +136,18 @@ export function BettingEngine() {
   const [error, setError]     = useState<string | null>(null)
 
   const load = useCallback(async () => {
-    setLoading(true)
     setError(null)
     try {
-      const [{ data: st }, { data: cy }] = await Promise.all([
+      const [{ data: st, error: e1 }, { data: cy, error: e2 }] = await Promise.all([
         supabase.from('v_betting_status').select('*').maybeSingle(),
-        supabase.from('betting_cycles')
+        supabase
+          .from('betting_cycles')
           .select('id,target_date,stake_usdc,multiplier,token_a_temp,token_b_temp,actual_temp,status,pnl_usdc,simulated,capped_at_max')
           .order('target_date', { ascending: false })
           .limit(20),
       ])
+      if (e1) throw new Error(e1.message)
+      if (e2) throw new Error(e2.message)
       setStatus(st)
       setCycles(cy ?? [])
     } catch (e) {
@@ -126,7 +159,7 @@ export function BettingEngine() {
 
   useEffect(() => {
     load()
-    const interval = setInterval(load, 60_000)  // refresco cada minuto
+    const interval = setInterval(load, 60_000)
     return () => clearInterval(interval)
   }, [load])
 
@@ -141,7 +174,7 @@ export function BettingEngine() {
   }, [load])
 
   // ─── Loading ──────────────────────────────────────────────────────────────
-  if (loading && !status) {
+  if (loading) {
     return (
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 flex items-center gap-3">
         <div className="w-4 h-4 border-2 border-gray-700 border-t-blue-500 rounded-full animate-spin" />
@@ -158,87 +191,59 @@ export function BettingEngine() {
     )
   }
 
+  // FIX #5: si no hay ningún ciclo todavía, mostrar estado vacío informativo
+  if (!status && cycles.length === 0) {
+    return <NoDataState />
+  }
+
   const bar = multiplierBar(
     status?.current_multiplier ?? null,
-    status?.max_stake && status?.base_stake ? status.max_stake / status.base_stake : null,
-    1
+    status?.max_stake && status?.base_stake
+      ? status.max_stake / status.base_stake
+      : null,
+    1,
   )
 
   return (
-    <section className="space-y-4">
+    <div className="space-y-4">
 
-      {/* ── Header ── */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h2 className="text-sm font-medium text-gray-300">🎯 Motor de Apuestas — Martingala</h2>
-          <span className={`text-xs px-2 py-0.5 rounded-full border font-medium
-            ${status?.betting_mode === 'live'
-              ? 'bg-red-950 text-red-400 border-red-800'
-              : 'bg-yellow-950 text-yellow-400 border-yellow-800'}`}>
-            {status?.betting_mode === 'live' ? '🔴 LIVE' : '🟡 SIMULADO'}
-          </span>
+      {/* ── KPIs globales ── */}
+      {status && (
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          {[
+            { label: 'Ciclos totales', value: status.total_cycles ?? '—', sub: null },
+            { label: 'Hit rate',       value: status.hit_rate_pct != null ? `${status.hit_rate_pct}%` : '—', sub: null },
+            { label: 'P&L total',      value: status.total_pnl != null ? `${status.total_pnl >= 0 ? '+' : ''}${status.total_pnl} USDC` : '—',
+              color: status.total_pnl != null ? pnlColor(status.total_pnl) : undefined },
+            { label: 'Stake actual',   value: status.latest_stake != null ? `${status.latest_stake} USDC` : '—', sub: null },
+            { label: 'Multiplicador',  value: status.current_multiplier != null ? `×${status.current_multiplier}` : '—', sub: null },
+          ].map(kpi => (
+            <div key={kpi.label} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+              <p className="text-xs text-gray-600 mb-1">{kpi.label}</p>
+              <p className={`text-lg font-mono font-semibold ${(kpi as any).color ?? 'text-white'}`}>
+                {kpi.value}
+              </p>
+            </div>
+          ))}
         </div>
-        <button
-          onClick={load}
-          className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
-        >
-          ↺ actualizar
-        </button>
-      </div>
-
-      {/* ── KPIs superiores ── */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        {[
-          { label: 'Hit Rate',      value: status?.hit_rate_pct != null ? `${status.hit_rate_pct}%` : '—',
-            sub: 'objetivo ≥ 90%',  ok: (status?.hit_rate_pct ?? 0) >= 90 },
-          { label: 'Ciclos',        value: String(status?.total_cycles ?? '—'),
-            sub: `${status?.won_cycles ?? 0}W / ${status?.lost_cycles ?? 0}L` },
-          { label: 'P&L Total',     value: status?.total_pnl != null
-              ? `${Number(status.total_pnl) >= 0 ? '+' : ''}${Number(status.total_pnl).toFixed(2)} USDC`
-              : '—',
-            positive: (status?.total_pnl ?? 0) >= 0 },
-          { label: 'Stake Actual',  value: status?.latest_stake != null ? `${status.latest_stake} USDC` : '—',
-            sub: `× ${status?.current_multiplier ?? 1} (base: ${status?.base_stake ?? '—'} USDC)` },
-          { label: 'Pérdidas racha',value: String(status?.consecutive_losses ?? 0),
-            sub: `máx stake: ${status?.max_stake ?? '—'} USDC`,
-            warn: (status?.consecutive_losses ?? 0) >= 3 },
-        ].map((kpi, i) => (
-          <div key={i} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <p className="text-xs text-gray-500 mb-1">{kpi.label}</p>
-            <p className={`text-lg font-bold ${
-              kpi.warn ? 'text-orange-400'
-              : kpi.ok  ? 'text-green-400'
-              : kpi.positive === true ? 'text-green-400'
-              : kpi.positive === false ? 'text-red-400'
-              : 'text-white'
-            }`}>
-              {kpi.value}
-            </p>
-            {kpi.sub && <p className="text-xs text-gray-600 mt-0.5">{kpi.sub}</p>}
-          </div>
-        ))}
-      </div>
+      )}
 
       {/* ── Barra Martingala ── */}
-      {bar && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="flex items-center justify-between mb-2">
-            <p className="text-xs text-gray-400">Nivel Martingala</p>
+      {bar && status && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-3">
+          <div className="flex items-center justify-between mb-1.5">
             <p className="text-xs text-gray-500">
-              {status?.current_multiplier}× — {status?.latest_stake} USDC
-              {status?.current_multiplier === 1 ? ' (base)' : ''}
-              {(status?.latest_stake ?? 0) >= (status?.max_stake ?? Infinity) ? ' ⚠️ TOPE' : ''}
+              Martingala — {status.consecutive_losses ?? 0} pérdida(s) consecutiva(s)
+            </p>
+            <p className="text-xs text-gray-500 font-mono">
+              {status.latest_stake ?? '—'} / {status.max_stake ?? '—'} USDC
             </p>
           </div>
-          <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+          <div className="w-full bg-gray-800 rounded-full h-1.5">
             <div
-              className={`h-full rounded-full transition-all duration-500 ${bar.color}`}
+              className={`h-1.5 rounded-full transition-all ${bar.color}`}
               style={{ width: `${bar.pct}%` }}
             />
-          </div>
-          <div className="flex justify-between mt-1 text-[10px] text-gray-600">
-            <span>{status?.base_stake} USDC (×1)</span>
-            <span>{status?.max_stake} USDC (máx)</span>
           </div>
         </div>
       )}
@@ -247,15 +252,28 @@ export function BettingEngine() {
       {status?.latest_date && (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
           <div className="flex items-center justify-between mb-3">
-            <p className="text-xs text-gray-400 font-medium uppercase tracking-wider">
-              Ciclo actual — {format(parseISO(status.latest_date), 'dd MMM yyyy', { locale: es })}
-            </p>
-            <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${statusBadge(status.latest_status)}`}>
-              {statusLabel(status.latest_status)}
-            </span>
+            <p className="text-xs text-gray-500 uppercase tracking-wider">Último ciclo</p>
+            <div className="flex items-center gap-2">
+              {status.simulated && (
+                <span className="text-[10px] text-yellow-600 border border-yellow-900 bg-yellow-950/30 rounded px-1.5 py-0.5">
+                  simulado
+                </span>
+              )}
+              <span className={`text-xs px-2 py-0.5 rounded border ${statusBadge(status.latest_status)}`}>
+                {statusLabel(status.latest_status)}
+              </span>
+            </div>
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div>
+              <p className="text-xs text-gray-600">Fecha objetivo</p>
+              <p className="font-mono text-white font-medium">
+                {status.latest_date
+                  ? format(parseISO(status.latest_date), 'dd MMM yyyy', { locale: es })
+                  : '—'}
+              </p>
+            </div>
             <div>
               <p className="text-xs text-gray-600">Token A</p>
               <p className="font-mono text-white font-medium">{status.token_a_temp ?? '—'}°C</p>
@@ -269,6 +287,14 @@ export function BettingEngine() {
               <p className="font-mono text-white font-medium">{status.shares?.toFixed(4) ?? '—'}</p>
             </div>
             <div>
+              <p className="text-xs text-gray-600">Coste A</p>
+              <p className="font-mono text-gray-300 text-sm">{status.cost_a_usdc?.toFixed(4) ?? '—'} USDC</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-600">Coste B</p>
+              <p className="font-mono text-gray-300 text-sm">{status.cost_b_usdc?.toFixed(4) ?? '—'} USDC</p>
+            </div>
+            <div>
               <p className="text-xs text-gray-600">Temp real</p>
               <p className={`font-mono font-medium ${
                 status.actual_temp != null ? 'text-white' : 'text-gray-600'
@@ -276,31 +302,33 @@ export function BettingEngine() {
                 {status.actual_temp != null ? `${status.actual_temp}°C` : 'pendiente'}
               </p>
             </div>
-          </div>
-
-          {status.latest_pnl != null && (
-            <div className="mt-3 pt-3 border-t border-gray-800 flex items-center justify-between">
-              <p className="text-xs text-gray-500">P&L del ciclo</p>
+            <div>
+              <p className="text-xs text-gray-600">P&L ciclo</p>
               <p className={`font-mono font-bold ${pnlColor(status.latest_pnl)}`}>
-                {status.latest_pnl >= 0 ? '+' : ''}{status.latest_pnl.toFixed(4)} USDC
+                {status.latest_pnl != null
+                  ? `${status.latest_pnl >= 0 ? '+' : ''}${status.latest_pnl.toFixed(4)} USDC`
+                  : '—'}
               </p>
             </div>
-          )}
+          </div>
         </div>
       )}
 
       {/* ── Historial de ciclos ── */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-800">
+        <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
           <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
             Historial de ciclos
           </p>
+          {cycles.length > 0 && (
+            <span className="text-xs text-gray-600">{cycles.length} ciclo(s)</span>
+          )}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-800">
-                {['Fecha','Stake','×Mult','Tokens','Temp Real','P&L','Estado'].map(h => (
+                {['Fecha', 'Stake', '×Mult', 'Tokens', 'Temp Real', 'P&L', 'Estado'].map(h => (
                   <th key={h} className="px-4 py-2 text-left text-xs text-gray-600 font-normal whitespace-nowrap">
                     {h}
                   </th>
@@ -310,7 +338,8 @@ export function BettingEngine() {
             <tbody>
               {cycles.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-6 text-center text-gray-600 text-xs">
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-600 text-xs">
+                    <p className="text-xl mb-1">📋</p>
                     Sin ciclos registrados todavía
                   </td>
                 </tr>
@@ -323,24 +352,26 @@ export function BettingEngine() {
                     {c.stake_usdc} USDC
                   </td>
                   <td className="px-4 py-2.5 text-xs font-mono">
-                    <span className={c.capped_at_max ? 'text-orange-400' : 'text-gray-400'}>
+                    <span className={c.capped_at_max ? 'text-red-400' : 'text-gray-400'}>
                       ×{c.multiplier}
-                      {c.capped_at_max && ' ⚠️'}
+                      {c.capped_at_max && <span className="ml-1 text-red-600">⚠</span>}
                     </span>
                   </td>
-                  <td className="px-4 py-2.5 text-xs font-mono text-blue-300">
+                  <td className="px-4 py-2.5 text-gray-400 font-mono text-xs whitespace-nowrap">
                     {c.token_a_temp}°C / {c.token_b_temp}°C
                   </td>
-                  <td className="px-4 py-2.5 text-xs font-mono text-gray-400">
-                    {c.actual_temp != null ? `${c.actual_temp}°C` : '—'}
+                  <td className="px-4 py-2.5 font-mono text-xs">
+                    <span className={c.actual_temp != null ? 'text-white' : 'text-gray-600'}>
+                      {c.actual_temp != null ? `${c.actual_temp}°C` : '—'}
+                    </span>
                   </td>
-                  <td className={`px-4 py-2.5 text-xs font-mono font-medium ${pnlColor(c.pnl_usdc)}`}>
+                  <td className={`px-4 py-2.5 font-mono text-xs font-semibold ${pnlColor(c.pnl_usdc)}`}>
                     {c.pnl_usdc != null
                       ? `${c.pnl_usdc >= 0 ? '+' : ''}${c.pnl_usdc.toFixed(4)}`
                       : '—'}
                   </td>
                   <td className="px-4 py-2.5">
-                    <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${statusBadge(c.status)}`}>
+                    <span className={`text-xs px-2 py-0.5 rounded border ${statusBadge(c.status)}`}>
                       {statusLabel(c.status)}
                     </span>
                   </td>
@@ -351,6 +382,6 @@ export function BettingEngine() {
         </div>
       </div>
 
-    </section>
+    </div>
   )
 }
