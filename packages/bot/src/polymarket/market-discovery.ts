@@ -1,10 +1,14 @@
 // src/polymarket/market-discovery.ts
 // Descubre todos los tokens de temperatura disponibles en Polymarket para una fecha dada.
-// Usa primero el endpoint /events (más eficiente), con fallback a búsqueda por slug individual.
-// Los resultados se cachean en Supabase para evitar llamadas repetidas a la API.
+//
+// Mecanismo IDÉNTICO al dashboard (/api/markets/route.ts):
+//   1. GET /events?slug=highest-temperature-in-madrid-on-{date}
+//   2. events[0].markets[] → sub-mercados con todos los tokens
+//   3. Temperatura: groupItemTitle ("18°C") o suffix del slug ("-18c")
+//   4. Precio YES: outcomePrices[0] (string JSON)
+//   5. Token ID: clobTokenIds[0] (string JSON)
 
 import axios from 'axios'
-import { format } from 'date-fns'
 import { supabase } from '../db/supabase'
 
 const GAMMA_BASE = 'https://gamma-api.polymarket.com'
@@ -12,229 +16,160 @@ const GAMMA_BASE = 'https://gamma-api.polymarket.com'
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
 export interface TemperatureToken {
-  slug: string
+  slug:        string
   tempCelsius: number
-  price: number         // precio del token YES (0.0 – 1.0)
-  tokenId: string
-  resolved: boolean
-  resolvedYes: boolean  // true si este token ganó (resolvió en YES)
+  label:       string   // "18°C" | "14°C or below" | "24°C or higher"
+  price:       number   // precio del token YES (0.0 – 1.0)
+  tokenId:     string
+  resolved:    boolean
+  resolvedYes: boolean
 }
 
 export interface DayMarkets {
-  date: string
-  available: boolean    // hay mercados para este día en Polymarket
-  tokens: TemperatureToken[]
-  resolvedTemp: number | null  // temperatura ganadora (null si aún no resuelto)
-  totalPriceSum: number        // suma de todos los precios (útil para el optimizador)
-  fetchedAt: string
+  date:          string
+  available:     boolean
+  tokens:        TemperatureToken[]
+  resolvedTemp:  number | null
+  totalPriceSum: number
+  fetchedAt:     string
 }
 
 // ─── MarketDiscovery ──────────────────────────────────────────────────────────
 
 export class MarketDiscovery {
-  // Rango de temperaturas a explorar para Madrid (°C)
-  // Cubre todas las estaciones con margen
-  private readonly TEMP_RANGE = { min: 5, max: 43 }
 
-  /**
-   * Obtiene todos los tokens de temperatura disponibles para una fecha.
-   * Intenta primero via /events (1 petición), luego fallback a slugs individuales.
-   */
   async getMarketsForDate(date: string, useCache = true): Promise<DayMarkets> {
-    // 1. Intentar desde cache de Supabase
+    // 1. Cache de Supabase
     if (useCache) {
       const cached = await this.getCached(date)
-      if (cached) {
-        // Re-usar cache solo si el día ya está resuelto o si tiene tokens (mercado activo)
-        if (cached.resolvedTemp !== null || cached.tokens.length > 0) {
-          return cached
-        }
+      if (cached && (cached.resolvedTemp !== null || cached.tokens.length > 0)) {
+        return cached
       }
     }
 
-    // 2. Intentar via endpoint /events (más eficiente)
-    const daySlug = this.buildDaySlug(date)
-    let result: DayMarkets | null = null
+    // 2. Fetch desde Gamma API via /events (igual que el dashboard)
+    const result = await this.fetchViaEvents(date)
 
-    try {
-      result = await this.fetchViaEvents(daySlug, date)
-    } catch (err) {
-      console.warn(`[MarketDiscovery] /events falló para ${date}:`, (err as Error).message)
-    }
-
-    // 3. Fallback: buscar slugs individuales por temperatura
-    if (!result || !result.available) {
-      try {
-        result = await this.fetchViaIndividualSlugs(date)
-      } catch (err) {
-        console.warn(`[MarketDiscovery] Fallback por slugs falló para ${date}:`, (err as Error).message)
-      }
-    }
-
-    if (!result) {
-      result = {
-        date,
-        available: false,
-        tokens: [],
-        resolvedTemp: null,
-        totalPriceSum: 0,
-        fetchedAt: new Date().toISOString(),
-      }
-    }
-
-    // 4. Cachear resultado si tiene datos
-    if (result.available || result.tokens.length === 0) {
+    // 3. Cachear si tiene datos
+    if (result.available) {
       await this.cacheResult(date, result)
     }
 
     return result
   }
 
-  /**
-   * Consulta el endpoint /events de Gamma API.
-   * Un evento del tipo "Madrid highest temp on DATE" contiene TODOS los mercados de temperatura.
-   */
-  private async fetchViaEvents(daySlug: string, date: string): Promise<DayMarkets> {
-    const res = await axios.get(`${GAMMA_BASE}/events`, {
-      params: { slug: daySlug },
-      timeout: 15000,
-    })
+  // ─── Fetch via /events ────────────────────────────────────────────────────
+  // Misma lógica que el dashboard: una sola llamada devuelve todos los sub-mercados
 
-    const events = Array.isArray(res.data) ? res.data : []
-    if (!events.length) {
-      // Intentar también con el slug del mercado directo
-      return await this.fetchViaMarketsSearch(date)
-    }
+  private async fetchViaEvents(date: string): Promise<DayMarkets> {
+    const daySlug = this.buildDaySlug(date)
 
-    const event = events[0]
-    const markets: any[] = event.markets || []
+    try {
+      const res = await axios.get(`${GAMMA_BASE}/events`, {
+        params: { slug: daySlug },
+        timeout: 12_000,
+      })
 
-    return this.parseMarketsFromList(markets, date)
-  }
+      const events: any[] = Array.isArray(res.data) ? res.data : []
 
-  /**
-   * Busca mercados usando el endpoint /markets con tag o title search.
-   */
-  private async fetchViaMarketsSearch(date: string): Promise<DayMarkets> {
-    const dateStr = this.buildDaySlug(date)
-
-    const res = await axios.get(`${GAMMA_BASE}/markets`, {
-      params: {
-        tag: 'weather',
-        slug_contains: `highest-temperature-in-madrid-on-${dateStr.replace('highest-temperature-in-madrid-on-', '')}`,
-        limit: 50,
-      },
-      timeout: 15000,
-    })
-
-    const markets = Array.isArray(res.data) ? res.data : []
-    return this.parseMarketsFromList(markets, date)
-  }
-
-  /**
-   * Fallback: prueba slugs individuales para cada temperatura del rango.
-   * Más lento pero funciona cuando el endpoint /events no devuelve resultados.
-   */
-  private async fetchViaIndividualSlugs(date: string): Promise<DayMarkets> {
-    const dateForSlug = this.formatDateForSlug(date)
-    const temps = Array.from(
-      { length: this.TEMP_RANGE.max - this.TEMP_RANGE.min + 1 },
-      (_, i) => i + this.TEMP_RANGE.min
-    )
-
-    console.log(`[MarketDiscovery] Buscando slugs individuales para ${date} (${temps.length} temperaturas)...`)
-
-    // Limitar concurrencia para no saturar la API
-    const BATCH_SIZE = 8
-    const markets: any[] = []
-
-    for (let i = 0; i < temps.length; i += BATCH_SIZE) {
-      const batch = temps.slice(i, i + BATCH_SIZE)
-      const batchResults = await Promise.allSettled(
-        batch.map(async (temp) => {
-          const slug = `highest-temperature-in-madrid-${temp}c-on-${dateForSlug}`
-          const res = await axios.get(`${GAMMA_BASE}/markets`, {
-            params: { slug },
-            timeout: 8000,
-          })
-          const data = Array.isArray(res.data) ? res.data : []
-          if (data.length > 0) return { temp, market: data[0] }
-          return null
-        })
-      )
-
-      for (const r of batchResults) {
-        if (r.status === 'fulfilled' && r.value) {
-          markets.push(r.value.market)
-        }
+      if (!events.length) {
+        console.warn(`[MarketDiscovery] Sin evento para ${date} (slug: ${daySlug})`)
+        return this.emptyResult(date)
       }
 
-      // Pequeña pausa entre batches
-      if (i + BATCH_SIZE < temps.length) {
-        await new Promise(resolve => setTimeout(resolve, 300))
-      }
-    }
+      const markets: any[] = events[0].markets ?? []
 
-    return this.parseMarketsFromList(markets, date)
+      if (!markets.length) {
+        console.warn(`[MarketDiscovery] Evento encontrado pero sin sub-mercados para ${date}`)
+        return this.emptyResult(date)
+      }
+
+      return this.parseMarkets(markets, date)
+
+    } catch (err) {
+      console.error(`[MarketDiscovery] Error fetching /events para ${date}:`, (err as Error).message)
+      return this.emptyResult(date)
+    }
   }
 
-  /**
-   * Parsea una lista de markets de la Gamma API y extrae los tokens de temperatura.
-   */
-  private parseMarketsFromList(markets: any[], date: string): DayMarkets {
+  // ─── parseMarkets (idéntico a parseTokens del dashboard) ─────────────────
+
+  private parseMarkets(markets: any[], date: string): DayMarkets {
     const tokens: TemperatureToken[] = []
     let resolvedTemp: number | null = null
 
-    for (const market of markets) {
-      // Extraer temperatura del slug: highest-temperature-in-madrid-Xc-on-...
-      const tempMatch = (market.slug || '').match(/-(\d+)c-on-/)
-      if (!tempMatch) continue
+    for (const m of markets) {
+      // ── Temperatura ────────────────────────────────────────────────────────
+      // Estrategia 1: groupItemTitle → "18°C" / "14°C or below" / "24°C or higher"
+      let tempCelsius: number | null = null
+      const label: string = m.groupItemTitle ?? ''
 
-      const tempCelsius = parseInt(tempMatch[1])
+      const titleMatch = label.match(/^(\d+)/)
+      if (titleMatch) tempCelsius = parseInt(titleMatch[1])
 
-      // El mercado puede tener tokens como array o como propiedad
-      const tokenList: any[] = market.tokens || market.outcomes || []
-      const yesToken = tokenList.find((t: any) =>
-        (t.outcome || t.name || '').toLowerCase() === 'yes'
-      )
+      // Estrategia 2: suffix del slug → ...-18c / ...-14corbelow / ...-24corhigher
+      if (tempCelsius === null) {
+        const slugMatch = (m.slug ?? '').match(/-(\d+)c(?:orbelow|orhigher)?$/)
+        if (slugMatch) tempCelsius = parseInt(slugMatch[1])
+      }
 
-      if (!yesToken) continue
+      if (tempCelsius === null) continue
 
-      const price = parseFloat(yesToken.price ?? yesToken.outcomePrices?.[0] ?? '0')
-      if (isNaN(price)) continue
+      // ── Precio YES ─────────────────────────────────────────────────────────
+      // outcomePrices: string JSON "[\"0.39\", \"0.61\"]"  (índice 0 = YES)
+      let price = 0
+      try {
+        const prices: string[] = typeof m.outcomePrices === 'string'
+          ? JSON.parse(m.outcomePrices)
+          : (m.outcomePrices ?? [])
+        price = parseFloat(prices[0] ?? '0') || 0
+        if (isNaN(price)) price = 0
+      } catch { price = 0 }
 
-      const resolved = market.closed === true || market.resolved === true || market.resolutionTime !== null
-      const resolvedPrice = parseFloat(market.resolvedPrice ?? market.resolved_price ?? 'NaN')
-      const resolvedYes = resolved && resolvedPrice === 1
+      // ── Token ID YES ───────────────────────────────────────────────────────
+      // clobTokenIds: string JSON "[\"<yes_id>\", \"<no_id>\"]"
+      let tokenId = ''
+      try {
+        const ids: string[] = typeof m.clobTokenIds === 'string'
+          ? JSON.parse(m.clobTokenIds)
+          : (m.clobTokenIds ?? [])
+        tokenId = ids[0] ?? ''
+      } catch { tokenId = '' }
+
+      // ── Resolución ─────────────────────────────────────────────────────────
+      const resolved = m.closed === true
+      const resolvedYes =
+        (resolved && parseFloat(m.resolvedPrice ?? 'NaN') === 1) ||
+        price >= 0.99 ||
+        parseFloat(m.lastTradePrice ?? '0') >= 0.99
 
       if (resolvedYes) resolvedTemp = tempCelsius
 
       tokens.push({
-        slug: market.slug || '',
+        slug:        m.slug ?? '',
         tempCelsius,
+        label:       label || `${tempCelsius}°C`,
         price,
-        tokenId: yesToken.tokenId || yesToken.token_id || '',
-        resolved,
+        tokenId,
+        resolved:    resolved || resolvedYes,
         resolvedYes,
       })
     }
 
-    // Ordenar por temperatura
     tokens.sort((a, b) => a.tempCelsius - b.tempCelsius)
-
-    const totalPriceSum = tokens.reduce((sum, t) => sum + t.price, 0)
+    const totalPriceSum = parseFloat(tokens.reduce((s, t) => s + t.price, 0).toFixed(4))
 
     return {
       date,
-      available: tokens.length > 0,
+      available:    tokens.length > 0,
       tokens,
       resolvedTemp,
-      totalPriceSum: parseFloat(totalPriceSum.toFixed(4)),
-      fetchedAt: new Date().toISOString(),
+      totalPriceSum,
+      fetchedAt:    new Date().toISOString(),
     }
   }
 
-  // ─── Cache ──────────────────────────────────────────────────────────────────
+  // ─── Cache ────────────────────────────────────────────────────────────────
 
   private async getCached(date: string): Promise<DayMarkets | null> {
     try {
@@ -247,8 +182,8 @@ export class MarketDiscovery {
       if (!data) return null
 
       const payload = data.payload as DayMarkets
-      // Re-fetch si: no está resuelto y tiene más de 1 hora
-      const ageMs = Date.now() - new Date(data.fetched_at).getTime()
+      const ageMs   = Date.now() - new Date(data.fetched_at).getTime()
+      // Re-fetch si no está resuelto y tiene más de 1 hora
       if (!payload.resolvedTemp && ageMs > 60 * 60 * 1000) return null
 
       return payload
@@ -259,45 +194,44 @@ export class MarketDiscovery {
 
   private async cacheResult(date: string, result: DayMarkets): Promise<void> {
     try {
-      await supabase.from('market_data_cache').upsert({
-        market_date: date,
-        payload: result,
-        fetched_at: result.fetchedAt,
-      }, { onConflict: 'market_date' })
+      await supabase.from('market_data_cache').upsert(
+        { market_date: date, payload: result, fetched_at: result.fetchedAt },
+        { onConflict: 'market_date' }
+      )
     } catch (err) {
       console.warn('[MarketDiscovery] No se pudo cachear:', (err as Error).message)
     }
   }
 
-  // ─── Helpers de slug ────────────────────────────────────────────────────────
+  // ─── Helpers ──────────────────────────────────────────────────────────────
 
   private buildDaySlug(date: string): string {
-    return `highest-temperature-in-madrid-on-${this.formatDateForSlug(date)}`
-  }
-
-  private formatDateForSlug(date: string): string {
-    // "2026-03-21" → "march-21-2026"
+    // "2026-03-26" → "highest-temperature-in-madrid-on-march-26-2026"
     const d = new Date(date + 'T12:00:00')
     const months = [
       'january','february','march','april','may','june',
       'july','august','september','october','november','december',
     ]
-    return `${months[d.getMonth()]}-${d.getDate()}-${d.getFullYear()}`
+    return `highest-temperature-in-madrid-on-${months[d.getMonth()]}-${d.getDate()}-${d.getFullYear()}`
   }
 
-  // ─── Utilidades públicas ────────────────────────────────────────────────────
+  private emptyResult(date: string): DayMarkets {
+    return {
+      date,
+      available:     false,
+      tokens:        [],
+      resolvedTemp:  null,
+      totalPriceSum: 0,
+      fetchedAt:     new Date().toISOString(),
+    }
+  }
 
-  /**
-   * Devuelve tokens disponibles para una fecha desde la cache (sin hacer fetch).
-   */
+  // ─── Utilidades públicas ──────────────────────────────────────────────────
+
   async getCachedMarkets(date: string): Promise<DayMarkets | null> {
     return this.getCached(date)
   }
 
-  /**
-   * Pre-carga un rango de fechas en batch (útil antes de un backtest).
-   * Devuelve el número de fechas con mercados encontrados.
-   */
   async prefetchDateRange(dates: string[], logFn?: (msg: string) => void): Promise<number> {
     let found = 0
     for (const date of dates) {
@@ -308,7 +242,6 @@ export class MarketDiscovery {
       } catch (err) {
         if (logFn) logFn(`[${date}] Error: ${(err as Error).message}`)
       }
-      // Rate limiting suave
       await new Promise(r => setTimeout(r, 100))
     }
     return found
