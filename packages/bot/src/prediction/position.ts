@@ -6,8 +6,11 @@
 //   token_b = Math.ceil(ensemble_temp) + 1  ← siguiente
 //
 // Presupuesto: 0.40 USDC por token = 0.80 USDC total
+//
+// Mecanismo de precios: igual que el dashboard
+//   → llama a /events?slug=<daySlug> y extrae los tokens del resultado
+//   → NO construye slugs de tokens individuales ni llama a /markets?slug=...
 
-import { buildTokenSlug } from '../polymarket/slugs'
 import { GammaClient } from '../polymarket/gamma'
 
 // ─── Presupuesto ──────────────────────────────────────────────────────────────
@@ -25,11 +28,13 @@ export type TokenSlot = 'a' | 'b'
 
 export interface TokenPosition {
   slot:         TokenSlot
-  tempCelsius:  number       // temperatura exacta del token (entera)
-  slug:         string       // slug de Polymarket
-  costUsdc:     number       // presupuesto asignado
-  priceAtBuy:   number | null  // precio YES en Polymarket al momento del cálculo
-  shares:       number | null  // costUsdc / priceAtBuy
+  tempCelsius:  number        // temperatura exacta del token (entera)
+  slug:         string        // slug del sub-mercado de Polymarket
+  tokenId:      string        // CLOB token ID (para órdenes reales)
+  label:        string        // "18°C" | "14°C or below"
+  costUsdc:     number        // presupuesto asignado
+  priceAtBuy:   number | null // precio YES en el momento del cálculo
+  shares:       number | null // costUsdc / priceAtBuy
 }
 
 export interface TwoTokenPosition {
@@ -51,36 +56,39 @@ export async function buildPosition(
 
   // ceil: si pred = 32.0 → token_a = 32; si pred = 32.1 → token_a = 33
   const ceilTemp = Math.ceil(ensembleTemp)
+  const tempsNeeded = [ceilTemp, ceilTemp + 1] as const
 
-  const defs: { slot: TokenSlot; tempCelsius: number }[] = [
-    { slot: 'a', tempCelsius: ceilTemp },
-    { slot: 'b', tempCelsius: ceilTemp + 1 },
-  ]
+  // ── Obtener todos los tokens del día en una sola llamada (igual que dashboard)
+  let dayTokens: Awaited<ReturnType<typeof gamma.getTokensForDate>>
+  try {
+    dayTokens = await gamma.getTokensForDate(targetDate)
+  } catch {
+    dayTokens = { available: false, tokens: [], resolvedTemp: null }
+  }
 
+  const slots: TokenSlot[] = ['a', 'b']
   const tokens: Record<TokenSlot, TokenPosition> = {} as any
   let marketAvailable = false
 
-  for (const def of defs) {
-    const slug     = buildTokenSlug(targetDate, def.tempCelsius)
-    const costUsdc = BUDGET[def.slot]
+  for (let i = 0; i < 2; i++) {
+    const slot       = slots[i]
+    const temp       = tempsNeeded[i]
+    const costUsdc   = BUDGET[slot]
 
-    let priceAtBuy: number | null = null
-    let shares:     number | null = null
+    // Buscar el token exacto por temperatura dentro del resultado del evento
+    const match = dayTokens.tokens.find(t => t.tempCelsius === temp)
 
-    try {
-      priceAtBuy = await gamma.getTokenPrice(slug)
-      if (priceAtBuy !== null && priceAtBuy > 0) {
-        shares = parseFloat((costUsdc / priceAtBuy).toFixed(4))
-        marketAvailable = true
-      }
-    } catch {
-      // Mercado no disponible aún — se reintentará en el job de apertura
-    }
+    const priceAtBuy = match?.price && match.price > 0 ? match.price : null
+    const shares     = priceAtBuy ? parseFloat((costUsdc / priceAtBuy).toFixed(4)) : null
 
-    tokens[def.slot] = {
-      slot:        def.slot,
-      tempCelsius: def.tempCelsius,
-      slug,
+    if (priceAtBuy) marketAvailable = true
+
+    tokens[slot] = {
+      slot,
+      tempCelsius: temp,
+      slug:        match?.slug    ?? '',
+      tokenId:     match?.tokenId ?? '',
+      label:       match?.label   ?? `${temp}°C`,
       costUsdc,
       priceAtBuy,
       shares,
@@ -90,9 +98,9 @@ export async function buildPosition(
   return {
     targetDate,
     ensembleTemp,
-    tokenA:          tokens.a,
-    tokenB:          tokens.b,
-    totalCostUsdc:   TOTAL_BUDGET,
+    tokenA:         tokens.a,
+    tokenB:         tokens.b,
+    totalCostUsdc:  TOTAL_BUDGET,
     marketAvailable,
   }
 }
