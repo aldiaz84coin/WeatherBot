@@ -128,7 +128,7 @@ export async function optimizeBias(cycleId?: string): Promise<BiasResult | null>
 
   await logger.log(
     'success',
-    'bias_update',
+    'weight_update',
     `Sesgo N = ${nSign}${n.toFixed(3)}°C  (delta vs ciclo anterior: ${sign}${delta.toFixed(3)}°C) — ` +
     `MAE post-corrección: ${mae.toFixed(3)}°C sobre ${pairs.length} días`,
     {
