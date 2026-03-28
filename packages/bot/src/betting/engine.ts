@@ -5,12 +5,13 @@
 // Flujo:
 //   1. Leer stake actual (base × multiplicador, respetando máximo)
 //   2. Consultar las fuentes con los pesos aprendidos → ensemble_temp
-//   3. Calcular token_a = ceil(pred), token_b = ceil(pred)+1
-//   4. Repartir el stake de forma que se compren el MISMO nº de shares
-//      de cada token: N = stake / (priceA + priceB)
-//   5. Guardar predicción + trades en Supabase (tablas existentes)
-//   6. Crear fila en betting_cycles para tracking de la Martingala
-//   7. Loggear todo en bot_events
+//   3. Aplicar sesgo N: ensemble_ajustado = ensemble + N
+//   4. Calcular token_a = ceil(ensemble_ajustado), token_b = ceil+1
+//   5. Repartir el stake de forma que se compren el MISMO nº de shares
+//      de cada token: shares = stake / (priceA + priceB)
+//   6. Guardar predicción + trades en Supabase (tablas existentes)
+//   7. Crear fila en betting_cycles para tracking de la Martingala
+//   8. Loggear todo en bot_events
 // ──────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config'
@@ -20,6 +21,7 @@ import { setupManager } from '../training/setup'
 import { buildPosition } from '../prediction/position'
 import { BotEventLogger } from './logger'
 import { getStakeConfig } from './config'
+import { getCurrentBias } from './bias-optimizer'
 
 const logger = new BotEventLogger('ENGINE')
 
@@ -95,12 +97,12 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
 
   // ── 3. Predicción de temperatura ─────────────────────────────────────────
   let sourceTemps: Record<string, number> = {}
-  let ensembleTemp: number
+  let ensembleRaw: number
 
   try {
     const forecast = await manager.getEnsembleForecast(tomorrow)
     sourceTemps    = forecast.sourceTemps
-    ensembleTemp   = forecast.ensembleTemp
+    ensembleRaw    = forecast.ensembleTemp
   } catch (err) {
     await logger.error(`Error obteniendo predicciones de fuentes`, err)
     // Registrar ciclo con error y abortar
@@ -118,13 +120,20 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     return
   }
 
+  // ── 3b. Aplicar sesgo N ───────────────────────────────────────────────────
+  // N = mean(actual - ensemble) calculado diariamente a las 08:00.
+  // ensemble_ajustado = ensemble + N  →  ceil(ensemble_ajustado) = token_a
+  const biasN       = await getCurrentBias()
+  const ensembleTemp = parseFloat((ensembleRaw + biasN).toFixed(4))
+  const nSign        = biasN >= 0 ? '+' : ''
+
   await logger.log('info', 'prediction',
-    `Ensemble: ${ensembleTemp.toFixed(1)}°C para ${tomorrow}`,
-    { ensembleTemp, sourceTemps }
+    `Ensemble: ${ensembleRaw.toFixed(3)}°C  +  N(${nSign}${biasN.toFixed(3)}°C)  =  ${ensembleTemp.toFixed(3)}°C para ${tomorrow}`,
+    { ensembleRaw, biasN, ensembleTemp, sourceTemps }
   )
 
-  // ── 4. Construir posición ─────────────────────────────────────────────────
-  // token_a = ceil(pred), token_b = ceil(pred)+1
+  // ── 4. Construir posición (con ensemble corregido) ────────────────────────
+  // token_a = ceil(ensemble + N), token_b = ceil(ensemble + N) + 1
   let position: Awaited<ReturnType<typeof buildPosition>>
 
   try {
