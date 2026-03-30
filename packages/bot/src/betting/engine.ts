@@ -276,29 +276,68 @@ async function createCycleFromExistingPrediction(
 ): Promise<void> {
   const { data: pred } = await supabase
     .from('predictions')
-    .select('ensemble_temp, token_a, token_b, cost_a_usdc, cost_b_usdc, source_temps, ensemble_config')
+    .select(`
+      ensemble_temp, token_a, token_b,
+      cost_a_usdc, cost_b_usdc, source_temps, ensemble_config,
+      trades ( position, price_at_buy, shares )
+    `)
     .eq('id', predictionId)
     .single()
 
-  if (!pred) return
+  if (!pred) {
+    await logger.error(`createCycleFromExistingPrediction: predicción ${predictionId} no encontrada`)
+    return
+  }
 
-  await supabase.from('betting_cycles').insert({
-    target_date:     tomorrow,
-    base_stake_usdc: stake.baseStake,
-    multiplier:      stake.multiplier,
-    stake_usdc:      stake.currentStake,
-    capped_at_max:   stake.cappedAtMax,
-    ensemble_temp:   pred.ensemble_temp,
-    token_a_temp:    pred.token_a,
-    token_b_temp:    pred.token_b,
-    cost_a_usdc:     pred.cost_a_usdc,
-    cost_b_usdc:     pred.cost_b_usdc,
-    prediction_id:   predictionId,
-    status:          'open',
-    simulated:       isSimulated,
-    source_temps:    pred.source_temps,
-    weights_used:    pred.ensemble_config,
-  })
+  const trades = (pred.trades ?? []) as Array<{ position: string; price_at_buy: number | null; shares: number | null }>
+  const tradeA = trades.find(t => t.position === 'a')
+  const tradeB = trades.find(t => t.position === 'b')
+
+  // Precios desde los trades; si no hay datos de mercado, asumir 0.5
+  const priceA = tradeA?.price_at_buy ?? 0.5
+  const priceB = tradeB?.price_at_buy ?? 0.5
+
+  // Recalcular shares con el stake ACTUAL (puede diferir del original por Martingala)
+  const shares = parseFloat((stake.currentStake / (priceA + priceB)).toFixed(6))
+  const costA  = parseFloat((shares * priceA).toFixed(4))
+  const costB  = parseFloat((shares * priceB).toFixed(4))
+
+  const { data: cycle, error: cycleErr } = await supabase
+    .from('betting_cycles')
+    .insert({
+      target_date:     tomorrow,
+      base_stake_usdc: stake.baseStake,
+      multiplier:      stake.multiplier,
+      stake_usdc:      stake.currentStake,
+      capped_at_max:   stake.cappedAtMax,
+      ensemble_temp:   pred.ensemble_temp,
+      token_a_temp:    pred.token_a,
+      token_b_temp:    pred.token_b,
+      price_a:         priceA,
+      price_b:         priceB,
+      shares,
+      cost_a_usdc:     costA,
+      cost_b_usdc:     costB,
+      prediction_id:   predictionId,
+      status:          'open',
+      simulated:       isSimulated,
+      source_temps:    pred.source_temps,
+      weights_used:    pred.ensemble_config,
+    })
+    .select('id')
+    .single()
+
+  if (cycleErr || !cycle) {
+    await logger.error(`Error creando cycle desde predicción existente: ${cycleErr?.message}`)
+    return
+  }
+
+  await logger.log('success', 'prediction',
+    `✅ Ciclo abierto (predicción reutilizada) para ${tomorrow} — ` +
+    `${pred.token_a}°C + ${pred.token_b}°C @ ${shares.toFixed(4)} shares`,
+    { cycleId: cycle.id, predId: predictionId, stake: stake.currentStake, priceA, priceB, shares },
+    cycle.id
+  )
 }
 
 // ─── Entrypoint directo ───────────────────────────────────────────────────────
