@@ -11,7 +11,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { useState, useCallback } from 'react'
-import type { AIOptimizerResult } from '../app/api/ai-optimizer/route'
+import type { AIOptimizerResult } from '../types/ai-optimizer'
 
 // ─── Helpers de estilo ────────────────────────────────────────────────────────
 
@@ -103,15 +103,27 @@ export function AIOptimizer() {
     }
   }, [mode, lookback])
 
-  // ── Aplicar pesos recomendados ───────────────────────────────────────────
+  // ── Aplicar pesos recomendados → /api/sources (PATCH) ───────────────────
   const applyWeights = useCallback(async () => {
     if (!result?.weightRecommendations.weights) return
     setApplying(true)
     try {
-      const res = await fetch('/api/comparison/save-weights', {
-        method:  'POST',
+      const slugMap: Record<string, string> = {
+        open_meteo:      'open-meteo',
+        aemet:           'aemet',
+        visual_crossing: 'visual-crossing',
+        weatherapi:      'weatherapi',
+        openweather:     'openweathermap',
+        tomorrow:        'tomorrow-io',
+        accuweather:     'accuweather',
+      }
+      const sourcesUpdate = Object.entries(result.weightRecommendations.weights)
+        .map(([key, weight]) => ({ slug: slugMap[key] ?? key, weight }))
+
+      const res = await fetch('/api/sources', {
+        method:  'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ weights: result.weightRecommendations.weights }),
+        body:    JSON.stringify({ sources: sourcesUpdate }),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setApplied('weights')
