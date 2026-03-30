@@ -190,6 +190,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       stake_usdc:     stake.currentStake,
       simulated:      isSimulated,
       ensemble_config: weightsUsed,
+      bias_applied:   parseFloat(biasN.toFixed(4)),
     })
     .select('id')
     .single()
@@ -244,6 +245,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       simulated:       isSimulated,
       source_temps:    sourceTemps,
       weights_used:    weightsUsed,
+      bias_applied:    parseFloat(biasN.toFixed(4)),
     })
     .select('id')
     .single()
@@ -278,7 +280,7 @@ async function createCycleFromExistingPrediction(
     .from('predictions')
     .select(`
       ensemble_temp, token_a, token_b,
-      cost_a_usdc, cost_b_usdc, source_temps, ensemble_config,
+      cost_a_usdc, cost_b_usdc, source_temps, ensemble_config, bias_applied,
       trades ( position, price_at_buy, shares )
     `)
     .eq('id', predictionId)
@@ -323,6 +325,7 @@ async function createCycleFromExistingPrediction(
       simulated:       isSimulated,
       source_temps:    pred.source_temps,
       weights_used:    pred.ensemble_config,
+      bias_applied:    pred.bias_applied ?? null,
     })
     .select('id')
     .single()
