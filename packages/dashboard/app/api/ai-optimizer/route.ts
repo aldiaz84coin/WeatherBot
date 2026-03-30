@@ -16,6 +16,9 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import type { AIOptimizerResult, SourceStats } from '../../../types/ai-optimizer'
+
+export type { AIOptimizerResult }
 
 // ─── Supabase (service key para escribir bot_config) ──────────────────────────
 const supabase = createClient(
@@ -44,46 +47,6 @@ interface TrainingRow {
   source_temps:              Record<string, number> | null
   weights_used:              Record<string, number> | null
   opt_weights_at_prediction: Record<string, number> | null
-}
-
-interface SourceStats {
-  mae:   number
-  rmse:  number
-  count: number
-  bias:  number   // mean(source - actual)
-}
-
-export interface AIOptimizerResult {
-  generatedAt:     string
-  cyclesAnalyzed:  number
-  hitRate:         number
-
-  // ── Optimización 1: Pesos de fuentes ──────────────────────
-  weightRecommendations: {
-    weights:         Record<string, number>   // pesos recomendados (suman 1)
-    sourceStats:     Record<string, SourceStats>
-    rationale:       string
-    expectedMAE:     number
-    improvedVsPrev:  number | null            // delta MAE vs pesos actuales
-  }
-
-  // ── Optimización 2: Offset y propuesta de apuesta ─────────
-  bettingRecommendations: {
-    optimalBias:     number                   // N óptimo para maximizar hit rate
-    proposedTokenA:  number | null            // ceil(ensemble_mañana + bias)
-    proposedTokenB:  number | null            // ceil+1
-    expectedHitRate: number                   // hit rate simulado con este bias
-    biasDistribution: Array<{
-      bias: number
-      hitRate: number
-      count: number
-    }>
-    rationale:       string
-  }
-
-  // ── Análisis general ──────────────────────────────────────
-  insights:          string[]
-  warnings:          string[]
 }
 
 // ─── GET — devolver último resultado cacheado ─────────────────────────────────
@@ -287,8 +250,6 @@ function computeSourceStats(rows: TrainingRow[]): Record<string, SourceStats> {
 function computeBiasDistribution(
   rows: TrainingRow[],
 ): Array<{ bias: number; hitRate: number; count: number }> {
-  // Simula distintos valores de bias [-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
-  // y calcula el hit rate que habría dado cada uno
   const candidates = [-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
 
   return candidates.map(bias => {
@@ -412,7 +373,6 @@ function buildUserPrompt(params: {
 
   const N = training.length
 
-  // Últimos 10 ciclos como muestra
   const recentSample = training.slice(0, 10).map(r => ({
     date:      r.target_date,
     ensemble:  r.ensemble_temp,
@@ -426,7 +386,6 @@ function buildUserPrompt(params: {
     offsetMis: r.offset_miss,
   }))
 
-  // Estadísticas globales del historial
   const avgErrorRaw  = training.reduce((s, r) => s + r.error_raw, 0) / N
   const avgErrorAdj  = training.reduce((s, r) => s + r.error_adj, 0) / N
   const avgOffMiss   = training.reduce((s, r) => s + r.offset_miss, 0) / N
