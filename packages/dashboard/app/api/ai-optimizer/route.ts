@@ -20,11 +20,7 @@ import type { AIOptimizerResult, SourceStats } from '../../../types/ai-optimizer
 
 export type { AIOptimizerResult }
 
-// ─── Supabase (service key para escribir bot_config) ──────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!,
-)
+export const dynamic = 'force-dynamic'
 
 // ─── Tipos internos ───────────────────────────────────────────────────────────
 
@@ -52,6 +48,10 @@ interface TrainingRow {
 // ─── GET — devolver último resultado cacheado ─────────────────────────────────
 
 export async function GET() {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_KEY!,
+  )
   const { data } = await supabase
     .from('bot_config')
     .select('value')
@@ -68,6 +68,10 @@ export async function GET() {
 // ─── POST — ejecutar optimización ─────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_KEY!,
+  )
   try {
     const body = await req.json().catch(() => ({}))
     const mode         = (body.mode ?? 'full') as 'weights' | 'bias' | 'full'
