@@ -1,16 +1,7 @@
 'use client'
 // packages/dashboard/components/AIOptimizer.tsx
-// ──────────────────────────────────────────────────────────────────────────────
-// Panel del Optimizador IA.
-// Consulta /api/ai-optimizer, muestra:
-//   • Hit rate histórico + ciclos analizados
-//   • Pesos recomendados por fuente (vs pesos actuales)
-//   • Bias óptimo + propuesta de tokens para mañana
-//   • Distribución de hit rate por bias
-//   • Insights / warnings del modelo
-// ──────────────────────────────────────────────────────────────────────────────
 
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import type { AIOptimizerResult } from '../types/ai-optimizer'
 
 // ─── Helpers de estilo ────────────────────────────────────────────────────────
@@ -72,19 +63,25 @@ export function AIOptimizer() {
   const [applying, setApplying] = useState(false)
   const [applied,  setApplied]  = useState<string | null>(null)
 
-  // ── Cargar último resultado cacheado al montar ──────────────────────────
+  // ── Cargar último resultado cacheado al montar ──────────────────────────────
   const loadCached = useCallback(async () => {
     try {
       const res = await fetch('/api/ai-optimizer')
-      const json = await res.json()
+      if (!res.ok) return
+      const text = await res.text()
+      if (!text) return
+      const json = JSON.parse(text)
       if (json.cached) setResult(json.cached as AIOptimizerResult)
-    } catch { /* silencioso */ }
+    } catch {
+      // silencioso — no hay caché todavía
+    }
   }, [])
 
-  // Llamar loadCached una sola vez al renderizar
-  useState(() => { loadCached() })
+  useEffect(() => {
+    loadCached()
+  }, [loadCached])
 
-  // ── Ejecutar optimización ────────────────────────────────────────────────
+  // ── Ejecutar optimización ────────────────────────────────────────────────────
   const runOptimizer = useCallback(async () => {
     setLoading(true); setError(null); setApplied(null)
     try {
@@ -93,7 +90,9 @@ export function AIOptimizer() {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ mode, lookbackDays: lookback }),
       })
-      const json = await res.json()
+      const text = await res.text()
+      if (!text) throw new Error('Respuesta vacía del servidor')
+      const json = JSON.parse(text)
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`)
       setResult(json as AIOptimizerResult)
     } catch (e: any) {
@@ -103,7 +102,7 @@ export function AIOptimizer() {
     }
   }, [mode, lookback])
 
-  // ── Aplicar pesos recomendados → /api/sources (PATCH) ───────────────────
+  // ── Aplicar pesos recomendados → /api/sources (PATCH) ──────────────────────
   const applyWeights = useCallback(async () => {
     if (!result?.weightRecommendations.weights) return
     setApplying(true)
@@ -134,7 +133,7 @@ export function AIOptimizer() {
     }
   }, [result])
 
-  // ── Aplicar bias recomendado ─────────────────────────────────────────────
+  // ── Aplicar bias recomendado ─────────────────────────────────────────────────
   const applyBias = useCallback(async () => {
     if (result?.bettingRecommendations.optimalBias == null) return
     setApplying(true)
@@ -156,12 +155,11 @@ export function AIOptimizer() {
   const w  = result?.weightRecommendations
   const b  = result?.bettingRecommendations
   const bd = b?.biasDistribution ?? []
-  const optimalBias = b?.optimalBias ?? 0
 
   return (
     <div className="space-y-4">
 
-      {/* ── Header + controles ─────────────────────────────────────────── */}
+      {/* ── Header + controles ───────────────────────────────────────────── */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <div className="flex flex-col sm:flex-row sm:items-center gap-4">
           <div className="flex-1">
@@ -173,9 +171,7 @@ export function AIOptimizer() {
             </p>
           </div>
 
-          {/* Controles */}
           <div className="flex flex-wrap gap-2 items-center">
-            {/* Modo */}
             <select
               value={mode}
               onChange={e => setMode(e.target.value as any)}
@@ -186,7 +182,6 @@ export function AIOptimizer() {
               <option value="bias">Solo bias/apuesta</option>
             </select>
 
-            {/* Lookback */}
             <select
               value={lookback}
               onChange={e => setLookback(Number(e.target.value))}
@@ -198,7 +193,6 @@ export function AIOptimizer() {
               <option value={90}>Últimos 90 días</option>
             </select>
 
-            {/* Botón ejecutar */}
             <button
               onClick={runOptimizer}
               disabled={loading}
@@ -224,7 +218,7 @@ export function AIOptimizer() {
         )}
       </div>
 
-      {/* ── Sin resultados todavía ─────────────────────────────────────── */}
+      {/* ── Sin resultados todavía ───────────────────────────────────────── */}
       {!result && !loading && (
         <div className="bg-gray-900 border border-dashed border-gray-700 rounded-xl p-8 text-center">
           <p className="text-gray-600 text-sm">
@@ -234,7 +228,7 @@ export function AIOptimizer() {
         </div>
       )}
 
-      {/* ── Resultados ────────────────────────────────────────────────── */}
+      {/* ── Resultados ──────────────────────────────────────────────────── */}
       {result && (
         <>
           {/* KPIs globales */}
@@ -255,19 +249,15 @@ export function AIOptimizer() {
             ))}
           </div>
 
-          {/* ── Sección 1: Pesos ──────────────────────────────────────── */}
+          {/* ── Sección 1: Pesos ────────────────────────────────────────── */}
           {w && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-white font-medium text-sm">
-                  📊 Pesos recomendados por fuente
-                </h3>
+                <h3 className="text-white font-medium text-sm">📊 Pesos recomendados por fuente</h3>
                 <div className="flex items-center gap-2">
                   {w.improvedVsPrev !== null && (
                     <span className={`text-xs px-2 py-0.5 rounded-full ${
-                      w.improvedVsPrev > 0
-                        ? 'bg-green-950 text-green-400'
-                        : 'bg-red-950 text-red-400'
+                      w.improvedVsPrev > 0 ? 'bg-green-950 text-green-400' : 'bg-red-950 text-red-400'
                     }`}>
                       {w.improvedVsPrev > 0 ? '↓' : '↑'} MAE {Math.abs(w.improvedVsPrev).toFixed(3)}°C
                     </span>
@@ -283,7 +273,6 @@ export function AIOptimizer() {
                 </div>
               </div>
 
-              {/* Tabla de pesos */}
               <div className="space-y-1.5">
                 {Object.entries(w.weights)
                   .sort(([, a], [, b]) => b - a)
@@ -293,10 +282,7 @@ export function AIOptimizer() {
                       <div key={src} className="flex items-center gap-3 text-xs">
                         <span className="w-24 text-gray-400 truncate">{src}</span>
                         <div className="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
-                          <div
-                            className="h-full bg-blue-500 rounded-full"
-                            style={{ width: pct(weight) }}
-                          />
+                          <div className="h-full bg-blue-500 rounded-full" style={{ width: pct(weight) }} />
                         </div>
                         <span className="w-10 text-right text-white font-mono tabular-nums">
                           {Math.round(weight * 100)}%
@@ -312,26 +298,20 @@ export function AIOptimizer() {
                   })}
               </div>
 
-              {/* MAE esperado */}
               <div className="flex items-center gap-2 pt-1 border-t border-gray-800">
                 <span className="text-gray-500 text-xs">MAE esperado con nuevos pesos:</span>
                 <span className="text-blue-300 text-xs font-mono">{flt(w.expectedMAE, 3)}°C</span>
               </div>
 
-              {/* Rationale */}
-              <p className="text-gray-500 text-xs leading-relaxed italic">
-                {w.rationale}
-              </p>
+              <p className="text-gray-500 text-xs leading-relaxed italic">{w.rationale}</p>
             </div>
           )}
 
-          {/* ── Sección 2: Bias + propuesta apuesta ──────────────────── */}
+          {/* ── Sección 2: Bias + propuesta apuesta ─────────────────────── */}
           {b && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-white font-medium text-sm">
-                  🎯 Bias óptimo y propuesta de apuesta
-                </h3>
+                <h3 className="text-white font-medium text-sm">🎯 Bias óptimo y propuesta de apuesta</h3>
                 <button
                   onClick={applyBias}
                   disabled={applying}
@@ -342,7 +322,6 @@ export function AIOptimizer() {
                 </button>
               </div>
 
-              {/* KPIs bias */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="bg-gray-800/60 rounded-xl p-3">
                   <p className="text-xs text-gray-600">Bias óptimo (N)</p>
@@ -368,7 +347,6 @@ export function AIOptimizer() {
                 </div>
               </div>
 
-              {/* Distribución de hit rate por bias */}
               {bd.length > 0 && (
                 <div className="space-y-1.5">
                   <p className="text-xs text-gray-600 mb-2">Simulación de hit rate por valor de bias:</p>
@@ -384,14 +362,11 @@ export function AIOptimizer() {
                 </div>
               )}
 
-              {/* Rationale */}
-              <p className="text-gray-500 text-xs leading-relaxed italic">
-                {b.rationale}
-              </p>
+              <p className="text-gray-500 text-xs leading-relaxed italic">{b.rationale}</p>
             </div>
           )}
 
-          {/* ── Insights y warnings ──────────────────────────────────── */}
+          {/* ── Insights y warnings ──────────────────────────────────────── */}
           {((result.insights?.length ?? 0) > 0 || (result.warnings?.length ?? 0) > 0) && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {result.insights?.length > 0 && (
@@ -400,8 +375,7 @@ export function AIOptimizer() {
                   <ul className="space-y-1.5">
                     {result.insights.map((ins, i) => (
                       <li key={i} className="text-xs text-gray-500 flex gap-1.5">
-                        <span className="text-blue-600 mt-0.5">•</span>
-                        {ins}
+                        <span className="text-blue-600 mt-0.5">•</span>{ins}
                       </li>
                     ))}
                   </ul>
@@ -413,8 +387,7 @@ export function AIOptimizer() {
                   <ul className="space-y-1.5">
                     {result.warnings.map((w, i) => (
                       <li key={i} className="text-xs text-yellow-700 flex gap-1.5">
-                        <span className="mt-0.5">•</span>
-                        {w}
+                        <span className="mt-0.5">•</span>{w}
                       </li>
                     ))}
                   </ul>
