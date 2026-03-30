@@ -8,12 +8,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!,
-)
+export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
+  // Cliente inicializado dentro del handler para evitar errores en build time
+  const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_KEY!,
+  )
+
   try {
     const { bias } = await req.json()
 
