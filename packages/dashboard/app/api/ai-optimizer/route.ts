@@ -48,31 +48,37 @@ interface TrainingRow {
 // ─── GET — devolver último resultado cacheado ─────────────────────────────────
 
 export async function GET() {
-  const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!,
-  )
-  const { data } = await supabase
-    .from('bot_config')
-    .select('value')
-    .eq('key', 'ai_optimizer_last_result')
-    .maybeSingle()
+  try {
+    const supabase = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_KEY!,
+    )
+    const { data } = await supabase
+      .from('bot_config')
+      .select('value')
+      .eq('key', 'ai_optimizer_last_result')
+      .maybeSingle()
 
-  if (!data) {
-    return NextResponse.json({ cached: null }, { status: 200 })
+    if (!data) {
+      return NextResponse.json({ cached: null }, { status: 200 })
+    }
+
+    return NextResponse.json({ cached: data.value }, { status: 200 })
+  } catch (err: any) {
+    console.error('[ai-optimizer GET] Error:', err)
+    return NextResponse.json({ error: err.message ?? 'Error interno' }, { status: 500 })
   }
-
-  return NextResponse.json({ cached: data.value }, { status: 200 })
 }
 
 // ─── POST — ejecutar optimización ─────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
-  const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!,
-  )
   try {
+    const supabase = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_KEY!,
+    )
+
     const body = await req.json().catch(() => ({}))
     const mode         = (body.mode ?? 'full') as 'weights' | 'bias' | 'full'
     const lookbackDays = Math.min(Number(body.lookbackDays ?? 60), 120)
@@ -136,7 +142,11 @@ export async function POST(req: NextRequest) {
     // ── 6. Llamar a Claude ───────────────────────────────────────────────────
     const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         process.env.ANTHROPIC_API_KEY!,
+        'anthropic-version': '2023-06-01',
+      },
       body:    JSON.stringify({
         model:      'claude-sonnet-4-20250514',
         max_tokens: 2000,
