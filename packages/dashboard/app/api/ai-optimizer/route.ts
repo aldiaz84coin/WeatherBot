@@ -22,6 +22,10 @@ export type { AIOptimizerResult }
 
 export const dynamic = 'force-dynamic'
 
+// ─── Helpers de entorno (compatibles con Vercel y Railway) ────────────────────
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY     ?? ''
+
 // ─── Tipos internos ───────────────────────────────────────────────────────────
 
 interface TrainingRow {
@@ -49,10 +53,7 @@ interface TrainingRow {
 
 export async function GET() {
   try {
-    const supabase = createClient(
-      process.env.SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_KEY!,
-    )
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
     const { data } = await supabase
       .from('bot_config')
       .select('value')
@@ -74,10 +75,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
-    const supabase = createClient(
-      process.env.SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_KEY!,
-    )
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 
     const body = await req.json().catch(() => ({}))
     const mode         = (body.mode ?? 'full') as 'weights' | 'bias' | 'full'
