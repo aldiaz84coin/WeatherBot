@@ -176,6 +176,8 @@ export function BettingEngine() {
       setTimeout(() => { load(); setRetryMsg(null) }, 5_000)
     }
   }, [load])
+
+  useEffect(() => {
     load()
     const interval = setInterval(load, 60_000)
     return () => clearInterval(interval)
