@@ -14,14 +14,19 @@ function getSupabase() {
   )
 }
 
+// Calcula "mañana" en hora de Madrid para que coincida con el bot (Railway TZ = Europe/Madrid)
+function getMadridTomorrow(): string {
+  const todayMadrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid' }).format(new Date())
+  // en-CA produce "YYYY-MM-DD"
+  const [y, m, d] = todayMadrid.split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10)
+}
+
 export async function POST() {
-  const supabase = getSupabase()
+  const supabase    = getSupabase()
+  const tomorrowStr = getMadridTomorrow()
 
-  // Guard: ¿ya existe un ciclo abierto para mañana?
-  const tomorrow = new Date()
-  tomorrow.setDate(tomorrow.getDate() + 1)
-  const tomorrowStr = tomorrow.toISOString().slice(0, 10)
-
+  // Guard: ¿ya existe un ciclo abierto para mañana (hora Madrid)?
   const { data: existing } = await supabase
     .from('betting_cycles')
     .select('id, status')
@@ -38,15 +43,19 @@ export async function POST() {
   // Activar flag
   const { error } = await supabase
     .from('bot_config')
-    .upsert({ key: 'pending_betting_retry', value: true, description: 'Retry ciclo de apuesta solicitado desde el dashboard' })
+    .upsert({
+      key:         'pending_betting_retry',
+      value:       true,
+      description: 'Retry ciclo de apuesta solicitado desde el dashboard',
+    })
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
   return NextResponse.json({
-    ok: true,
-    message: 'Flag activado. El bot relanzará el ciclo en los próximos 30 segundos.',
-    targetDate: tomorrowStr,
+    ok:          true,
+    message:     `Ciclo (+ órdenes) para ${tomorrowStr} se relanzará en ~30 segundos.`,
+    targetDate:  tomorrowStr,
   })
 }
