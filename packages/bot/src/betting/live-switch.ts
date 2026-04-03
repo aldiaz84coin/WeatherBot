@@ -2,28 +2,30 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Transición en caliente de modo simulado → live.
 //
-// Flujo:
+// Flujo al activar live:
 //   1. El dashboard setea betting_mode="live" Y pending_live_switch=true
-//   2. El scheduler (cada 30 s) o en startup llama checkAndExecuteLiveSwitch()
-//   3. Si el flag está activo:
-//      a. Loguea la configuración completa activa
-//      b. Busca el ciclo simulado abierto para mañana
-//      c. Obtiene precios frescos de Polymarket (fallback al precio guardado)
-//      d. Ejecuta órdenes reales via ClobClient
-//      e. Actualiza trades/ciclo/predicción a simulated=false con orderIds reales
-//      f. Loguea confirmación y limpia el flag
+//   2. El scheduler (cada 30 s) detecta el flag y llama checkAndExecuteLiveSwitch()
+//   3. Se cancela el ciclo simulado abierto para mañana (si existe)
+//   4. Se genera una predicción fresca en ese momento con el ensemble actual
+//   5. Se aplica sesgo N y se construye la posición de 2 tokens
+//   6. Se ejecutan órdenes REALES en Polymarket a 1× stake base (sin Martingala)
+//   7. Se guardan predicción + trades + cycle en Supabase como simulated=false
+//   8. Los ciclos siguientes corren normalmente desde engine.ts a las 00:30
+//      con los parámetros configurados (Martingala, etc.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { format, addDays } from 'date-fns'
-import { supabase }        from '../db/supabase'
-import { BotEventLogger }  from './logger'
+import { format, addDays }  from 'date-fns'
+import { supabase }          from '../db/supabase'
+import { BotEventLogger }    from './logger'
 import { getStakeConfig, getConfigValue, setConfigValue } from './config'
-import { getCurrentBias } from './bias-optimizer'
-import { ClobClient }      from '../polymarket/clob'
+import { getCurrentBias }    from './bias-optimizer'
+import { setupManager }      from '../training/setup'
+import { buildPosition }     from '../prediction/position'
+import { ClobClient }        from '../polymarket/clob'
 
 const logger = new BotEventLogger('LIVE-SWITCH')
 
-// ─── Entrypoint — llamado desde el scheduler ──────────────────────────────────
+// ─── Entrypoint — llamado desde el scheduler cada 30 s ───────────────────────
 
 export async function checkAndExecuteLiveSwitch(): Promise<void> {
   const pending = await getConfigValue<boolean>('pending_live_switch')
@@ -54,163 +56,317 @@ async function executeLiveSwitch(): Promise<void> {
   // ── 1. Log: config completa activa al activar modo live ───────────────────
   await logLiveModeConfig(tomorrow, stake)
 
-  // ── 2. Buscar ciclo simulado abierto para mañana ──────────────────────────
+  // ── 2. Cancelar ciclo simulado abierto para mañana (si existe) ────────────
+  await cancelSimulatedCycle(tomorrow)
+
+  // ── 3. Cargar pesos de fuentes desde Supabase ─────────────────────────────
+  const { data: sourcesData } = await supabase
+    .from('weather_sources')
+    .select('slug, weight')
+    .eq('active', true)
+
+  const customWeights: Record<string, number> = sourcesData
+    ? Object.fromEntries(sourcesData.map(s => [s.slug, s.weight ?? 0]))
+    : {}
+
+  // ── 4. Leer sesgo N ───────────────────────────────────────────────────────
+  const biasN = await getCurrentBias()
+
+  // ── 5. Generar predicción fresca con el ensemble actual ───────────────────
+  await logger.log('info', 'prediction',
+    `🌡️  Generando predicción fresca para ${tomorrow}…`
+  )
+
+  const manager     = await setupManager(customWeights)
+  const ensembleRes = await manager.getEnsembleForecast(tomorrow)
+  const rawEnsemble = ensembleRes.ensembleTemp
+
+  if (!rawEnsemble) {
+    await logger.error(`No se pudo obtener ensemble para ${tomorrow} — transición abortada`)
+    return
+  }
+
+  const adjustedEnsemble = rawEnsemble + biasN
+
+  const signN = biasN >= 0 ? '+' : ''
+  await logger.log('info', 'prediction',
+    `Ensemble: ${rawEnsemble.toFixed(2)}°C  ${signN}${biasN.toFixed(2)}°C (sesgo N)  →  ajustado: ${adjustedEnsemble.toFixed(2)}°C`,
+    { rawEnsemble, biasN, adjustedEnsemble }
+  )
+
+  // ── 6. Construir posición de 2 tokens ────────────────────────────────────
+  const position = await buildPosition(adjustedEnsemble, tomorrow)
+  const tokenA   = position.tokenA.tempCelsius
+  const tokenB   = position.tokenB.tempCelsius
+  const priceA   = position.tokenA.priceAtBuy
+  const priceB   = position.tokenB.priceAtBuy
+
+  await logger.log('info', 'prediction',
+    `Tokens: ${tokenA}°C / ${tokenB}°C | ` +
+    `Precios: ${priceA ? (priceA * 100).toFixed(1) : '?'}¢ / ${priceB ? (priceB * 100).toFixed(1) : '?'}¢`
+  )
+
+  // ── 7. Calcular stake 1× (sin Martingala — primer ciclo live siempre base) ─
+  const liveStake = stake.baseStake   // siempre 1×, independiente de la racha
+  const priceSum  = (priceA ?? 0) + (priceB ?? 0)
+  const shares    = priceSum > 0 ? liveStake / priceSum : 0
+  const costA     = shares * (priceA ?? 0)
+  const costB     = shares * (priceB ?? 0)
+
+  await logger.log('info', 'prediction',
+    `Stake: $${liveStake.toFixed(2)} (1× base — primer ciclo live) | ` +
+    `Shares: ${shares.toFixed(4)} c/token`
+  )
+
+  // ── 8. Persistir predicción en Supabase ──────────────────────────────────
+  const { data: prediction, error: predError } = await supabase
+    .from('predictions')
+    .insert({
+      target_date:       tomorrow,
+      predicted_at:      new Date().toISOString(),
+      ensemble_temp:     rawEnsemble,
+      bias_applied:      biasN,
+      ensemble_adjusted: adjustedEnsemble,
+      source_temps:      ensembleRes.sourceTemps,
+      ensemble_config:   ensembleRes.weights,
+      opt_weights:       customWeights,
+      token_a:           tokenA,
+      token_b:           tokenB,
+      cost_a_usdc:       costA,
+      cost_b_usdc:       costB,
+      stake_usdc:        liveStake,
+      simulated:         false,   // ← LIVE
+      settled:           false,
+      comparison_source: false,
+      token_low: null, token_mid: null, token_high: null,
+      cost_low_usdc: null, cost_mid_usdc: null, cost_high_usdc: null,
+    })
+    .select()
+    .single()
+
+  if (predError || !prediction) {
+    await logger.error(`Error guardando predicción live: ${predError?.message}`, predError)
+    return
+  }
+
+  // ── 9. Ejecutar órdenes reales via CLOB ──────────────────────────────────
+  const clob = new ClobClient(
+    process.env.POLYMARKET_API_KEY!,
+    process.env.POLYMARKET_PRIVATE_KEY!
+  )
+
+  type OrderResult = {
+    slot:      'a' | 'b'
+    tokenTemp: number
+    slug:      string
+    orderId:   string | null
+    priceUsed: number
+    costUsdc:  number
+    shares:    number
+    success:   boolean
+    errorMsg?: string
+  }
+
+  const orderDefs = [
+    { slot: 'a' as const, token: position.tokenA, tempCelsius: tokenA, cost: costA },
+    { slot: 'b' as const, token: position.tokenB, tempCelsius: tokenB, cost: costB },
+  ]
+
+  const results: OrderResult[] = []
+
+  for (const def of orderDefs) {
+    let orderId: string | null = null
+    let success = false
+    let errorMsg: string | undefined
+
+    const price = def.token.priceAtBuy
+
+    if (!price) {
+      errorMsg = 'Precio no disponible — mercado no activo aún'
+      await logger.log('warn', 'prediction',
+        `   ⚠️  Token ${def.tempCelsius}°C (${def.slot}): ${errorMsg}`
+      )
+    } else {
+      try {
+        const order = await clob.placeOrder({
+          tokenId: def.token.tokenId,
+          side:    'BUY',
+          price,
+          size:    def.cost,
+        })
+        orderId = order.orderId
+        success = true
+
+        await logger.log('success', 'prediction',
+          `   ✅ Orden REAL ejecutada: ${def.tempCelsius}°C (${def.slot}) ` +
+          `@ ${(price * 100).toFixed(1)}¢ · $${def.cost.toFixed(2)} USDC → orderId: ${orderId}`
+        )
+      } catch (err: any) {
+        errorMsg = err?.message ?? String(err)
+        await logger.error(
+          `   ❌ Error orden ${def.tempCelsius}°C (${def.slot}): ${errorMsg}`,
+          err
+        )
+      }
+    }
+
+    results.push({
+      slot:      def.slot,
+      tokenTemp: def.tempCelsius,
+      slug:      def.token.slug,
+      orderId,
+      priceUsed: price ?? 0,
+      costUsdc:  def.cost,
+      shares,
+      success,
+      errorMsg,
+    })
+  }
+
+  // ── 10. Persistir trades en Supabase ─────────────────────────────────────
+  const resA = results.find(r => r.slot === 'a')!
+  const resB = results.find(r => r.slot === 'b')!
+
+  const { error: tradesError } = await supabase
+    .from('trades')
+    .insert([
+      {
+        prediction_id:       prediction.id,
+        slug:                position.tokenA.slug,
+        token_temp:          tokenA,
+        position:            'a',
+        cost_usdc:           costA,
+        price_at_buy:        priceA,
+        shares,
+        simulated:           false,
+        status:              'open',
+        polymarket_order_id: resA.orderId,
+      },
+      {
+        prediction_id:       prediction.id,
+        slug:                position.tokenB.slug,
+        token_temp:          tokenB,
+        position:            'b',
+        cost_usdc:           costB,
+        price_at_buy:        priceB,
+        shares,
+        simulated:           false,
+        status:              'open',
+        polymarket_order_id: resB.orderId,
+      },
+    ])
+
+  if (tradesError) {
+    await logger.error(`Error guardando trades: ${tradesError.message}`, tradesError)
+  }
+
+  // ── 11. Crear betting_cycle live con multiplier=1 ─────────────────────────
+  const { data: cycle, error: cycleError } = await supabase
+    .from('betting_cycles')
+    .insert({
+      target_date:   tomorrow,
+      prediction_id: prediction.id,
+      stake_usdc:    liveStake,
+      multiplier:    1,           // ← siempre 1× en el primer ciclo live
+      status:        'open',
+      simulated:     false,       // ← LIVE
+    })
+    .select()
+    .single()
+
+  if (cycleError) {
+    await logger.error(`Error creando betting_cycle: ${cycleError.message}`, cycleError)
+    return
+  }
+
+  // ── 12. Log resumen final ─────────────────────────────────────────────────
+  const successCount = results.filter(r => r.success).length
+  const failCount    = results.filter(r => !r.success).length
+  const orderIds     = results.map(r => r.orderId ?? '(FAILED)').join(', ')
+
+  await logger.log(
+    successCount === 2 ? 'success' : failCount === 2 ? 'error' : 'warn',
+    'prediction',
+    `🔴 TRANSICIÓN LIVE COMPLETADA — ${tomorrow}: ` +
+    `${successCount}/2 órdenes ejecutadas | ` +
+    `stake: $${liveStake.toFixed(2)} (1× base) | ` +
+    `tokens: ${tokenA}°/${tokenB}° | ` +
+    `orderIds: [${orderIds}]` +
+    (failCount > 0 ? ` | ⚠️ ${failCount} orden(es) fallaron` : ''),
+    {
+      targetDate:    tomorrow,
+      cycleId:       cycle.id,
+      predictionId:  prediction.id,
+      successCount,
+      failCount,
+      stake:         liveStake,
+      multiplier:    1,
+      tokenA, tokenB, priceA, priceB, shares,
+      orders:        results,
+      note:          'Siguiente ciclo (00:30) aplicará Martingala configurada normalmente',
+    }
+  )
+}
+
+// ─── Cancelar ciclo simulado de mañana ───────────────────────────────────────
+// Marca el ciclo y sus trades como cancelados para que el engine no los duplique
+
+async function cancelSimulatedCycle(tomorrow: string): Promise<void> {
   const { data: cycle, error: cycleErr } = await supabase
     .from('betting_cycles')
-    .select('id, prediction_id, stake_usdc, multiplier')
+    .select('id, prediction_id')
     .eq('target_date', tomorrow)
     .eq('simulated', true)
     .eq('status', 'open')
     .maybeSingle()
 
   if (cycleErr) {
-    await logger.error(`Error buscando ciclo pendiente: ${cycleErr.message}`, cycleErr)
+    await logger.error(`Error buscando ciclo simulado: ${cycleErr.message}`, cycleErr)
     return
   }
 
   if (!cycle) {
-    await logger.log(
-      'warn', 'info',
-      `⚠️  No hay ciclo simulado abierto para ${tomorrow}. ` +
-      `El próximo ciclo (00:30) ya se ejecutará en modo real.`,
-      { tomorrow }
+    await logger.log('info', 'info',
+      `ℹ️  No había ciclo simulado abierto para ${tomorrow} — se creará uno live nuevo`
     )
     return
   }
 
-  await logger.log(
-    'info', 'prediction',
-    `📋 Ciclo simulado encontrado para ${tomorrow} (id: ${cycle.id}) — ejecutando órdenes reales...`
-  )
-
-  // ── 3. Buscar trades pendientes del ciclo ─────────────────────────────────
-  const { data: trades, error: tradesErr } = await supabase
+  // Cancelar trades del ciclo simulado
+  const { error: tradesErr } = await supabase
     .from('trades')
-    .select('id, slug, token_temp, position, cost_usdc, price_at_buy, shares')
+    .update({ status: 'cancelled' })
     .eq('prediction_id', cycle.prediction_id)
     .eq('simulated', true)
     .eq('status', 'open')
 
   if (tradesErr) {
-    await logger.error(`Error leyendo trades: ${tradesErr.message}`, tradesErr)
-    return
+    await logger.error(`Error cancelando trades simulados: ${tradesErr.message}`, tradesErr)
   }
 
-  if (!trades || trades.length === 0) {
-    await logger.log('warn', 'info', `⚠️  No se encontraron trades abiertos para el ciclo ${cycle.id}`)
-    return
+  // Marcar predicción simulada como settled para que no interfiera
+  const { error: predErr } = await supabase
+    .from('predictions')
+    .update({ settled: true })
+    .eq('id', cycle.prediction_id)
+
+  if (predErr) {
+    await logger.error(`Error marcando predicción simulada: ${predErr.message}`, predErr)
   }
 
-  // ── 4. Obtener precios frescos de Polymarket ──────────────────────────────
-  const freshPrices = await fetchFreshPrices(tomorrow)
-  if (freshPrices) {
-    await logger.log('info', 'info', `📈 Precios frescos obtenidos de Polymarket para ${tomorrow}`)
+  // Marcar ciclo como skipped
+  const { error: cycleUpdateErr } = await supabase
+    .from('betting_cycles')
+    .update({ status: 'skipped' })
+    .eq('id', cycle.id)
+
+  if (cycleUpdateErr) {
+    await logger.error(`Error cancelando ciclo simulado: ${cycleUpdateErr.message}`, cycleUpdateErr)
   } else {
-    await logger.log('warn', 'info', `⚠️  No se pudieron obtener precios frescos — usando precios guardados en BD`)
+    await logger.log('info', 'info',
+      `🗑️  Ciclo simulado ${cycle.id} para ${tomorrow} marcado como skipped — reemplazado por ciclo live`
+    )
   }
-
-  // ── 5. Ejecutar órdenes reales via CLOB ───────────────────────────────────
-  const clob = new ClobClient(
-    process.env.POLYMARKET_API_KEY!,
-    process.env.POLYMARKET_PRIVATE_KEY!
-  )
-
-  type TradeResult = {
-    tradeId:   string
-    tokenTemp: number
-    position:  string
-    orderId:   string | null
-    priceUsed: number
-    costUsdc:  number
-    success:   boolean
-    errorMsg?: string
-  }
-
-  const results: TradeResult[] = []
-
-  for (const trade of trades) {
-    // Precio fresco si está disponible, fallback al guardado en BD
-    const freshPrice = freshPrices?.[trade.slug] ?? null
-    const priceToUse = freshPrice ?? trade.price_at_buy
-
-    let orderId: string | null = null
-    let success = false
-    let errorMsg: string | undefined
-
-    try {
-      const order = await clob.placeOrder({
-        tokenId: trade.slug,
-        side:    'BUY',
-        price:   priceToUse,
-        size:    trade.cost_usdc,
-      })
-      orderId = order.orderId
-      success = true
-
-      await logger.log(
-        'success', 'prediction',
-        `   ✅ Orden REAL ejecutada: ${trade.token_temp}°C (pos ${trade.position}) ` +
-        `@ $${priceToUse.toFixed(4)} · $${trade.cost_usdc.toFixed(2)} USDC → orderId: ${orderId}`
-      )
-    } catch (err: any) {
-      errorMsg = err?.message ?? String(err)
-      await logger.error(
-        `   ❌ Error ejecutando orden ${trade.token_temp}°C (${trade.position}): ${errorMsg}`,
-        err
-      )
-    }
-
-    results.push({ tradeId: trade.id, tokenTemp: trade.token_temp, position: trade.position,
-                   orderId, priceUsed: priceToUse, costUsdc: trade.cost_usdc, success, errorMsg })
-
-    // Actualizar trade en BD — precio fresco + orderId + simulated=false
-    const { error: updateErr } = await supabase
-      .from('trades')
-      .update({
-        simulated:           false,
-        price_at_buy:        priceToUse,
-        polymarket_order_id: orderId,
-      })
-      .eq('id', trade.id)
-
-    if (updateErr) {
-      await logger.error(`Error actualizando trade ${trade.id}: ${updateErr.message}`, updateErr)
-    }
-  }
-
-  // ── 6. Actualizar ciclo y predicción a simulated=false ────────────────────
-  const [{ error: cycleUpdateErr }, { error: predUpdateErr }] = await Promise.all([
-    supabase.from('betting_cycles').update({ simulated: false }).eq('id', cycle.id),
-    supabase.from('predictions').update({ simulated: false }).eq('id', cycle.prediction_id),
-  ])
-
-  if (cycleUpdateErr) await logger.error(`Error actualizando ciclo: ${cycleUpdateErr.message}`, cycleUpdateErr)
-  if (predUpdateErr)  await logger.error(`Error actualizando predicción: ${predUpdateErr.message}`, predUpdateErr)
-
-  // ── 7. Log resumen final ──────────────────────────────────────────────────
-  const successCount = results.filter(r => r.success).length
-  const failCount    = results.filter(r => !r.success).length
-  const orderIds     = results.map(r => r.orderId ?? '(FAILED)').join(', ')
-  const totalStake   = results.reduce((sum, r) => sum + r.costUsdc, 0)
-
-  await logger.log(
-    successCount === results.length ? 'success' : failCount === results.length ? 'error' : 'warn',
-    'prediction',
-    `🔴 TRANSICIÓN LIVE COMPLETADA — ${tomorrow}: ` +
-    `${successCount}/${results.length} órdenes ejecutadas | ` +
-    `stake total: $${totalStake.toFixed(2)} USDC | ` +
-    `orderIds: [${orderIds}]` +
-    (failCount > 0 ? ` | ⚠️ ${failCount} orden(es) fallaron — revisar logs` : ''),
-    {
-      targetDate:   tomorrow,
-      cycleId:      cycle.id,
-      predictionId: cycle.prediction_id,
-      successCount,
-      failCount,
-      totalStake,
-      orders:       results,
-    }
-  )
 }
 
 // ─── Log de configuración completa al activar live ───────────────────────────
@@ -242,16 +398,16 @@ async function logLiveModeConfig(
       'success',
       'weight_update',
       `🔴 MODO LIVE ACTIVADO ─── Configuración para ${targetDate}\n` +
-      `   stake:    $${stake.currentStake} (base $${stake.baseStake} ×${stake.multiplier})${capInfo}\n` +
+      `   stake:    $${stake.baseStake} (1× base — Martingala desde el 2º ciclo)${capInfo}\n` +
       `   max:      $${stake.maxStake} | racha pérdidas: ${stake.consecutiveLosses}\n` +
       `   bias N:   ${signN}${biasN.toFixed(2)}°C\n` +
       `   pesos:    ${weightsSummary || '(sin fuentes activas)'}`,
       {
         targetDate,
         bettingMode:       'live',
-        stake:             stake.currentStake,
+        stake:             stake.baseStake,
         baseStake:         stake.baseStake,
-        multiplier:        stake.multiplier,
+        multiplier:        1,
         maxStake:          stake.maxStake,
         cappedAtMax:       stake.cappedAtMax,
         consecutiveLosses: stake.consecutiveLosses,
@@ -264,10 +420,9 @@ async function logLiveModeConfig(
   }
 }
 
-// ─── Fetch precios frescos de Polymarket ─────────────────────────────────────
-// Devuelve un mapa slug → priceYes, o null si falla
+// ─── Helper público: fetch precios frescos de Polymarket ─────────────────────
 
-async function fetchFreshPrices(date: string): Promise<Record<string, number> | null> {
+export async function fetchFreshPricesForDate(date: string): Promise<Record<string, number> | null> {
   try {
     const months = [
       'january','february','march','april','may','june',
