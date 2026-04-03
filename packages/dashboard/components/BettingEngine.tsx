@@ -130,10 +130,12 @@ function NoDataState() {
 // ─── Componente principal ─────────────────────────────────────────────────────
 
 export function BettingEngine() {
-  const [status, setStatus]   = useState<BettingStatus | null>(null)
-  const [cycles, setCycles]   = useState<BettingCycle[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError]     = useState<string | null>(null)
+  const [status, setStatus]       = useState<BettingStatus | null>(null)
+  const [cycles, setCycles]       = useState<BettingCycle[]>([])
+  const [loading, setLoading]     = useState(true)
+  const [error, setError]         = useState<string | null>(null)
+  const [retrying, setRetrying]   = useState(false)
+  const [retryMsg, setRetryMsg]   = useState<{ ok: boolean; text: string } | null>(null)
 
   const load = useCallback(async () => {
     setError(null)
@@ -157,7 +159,23 @@ export function BettingEngine() {
     }
   }, [])
 
-  useEffect(() => {
+  const handleRetryCycle = useCallback(async () => {
+    setRetrying(true)
+    setRetryMsg(null)
+    try {
+      const res  = await fetch('/api/betting/retry-cycle', { method: 'POST' })
+      const data = await res.json()
+      setRetryMsg(res.ok
+        ? { ok: true,  text: data.message ?? 'Retry solicitado. El bot ejecutará en ~30 s.' }
+        : { ok: false, text: data.error   ?? 'Error desconocido' }
+      )
+    } catch {
+      setRetryMsg({ ok: false, text: 'Error de red al contactar con la API' })
+    } finally {
+      setRetrying(false)
+      setTimeout(() => { load(); setRetryMsg(null) }, 5_000)
+    }
+  }, [load])
     load()
     const interval = setInterval(load, 60_000)
     return () => clearInterval(interval)
@@ -320,9 +338,30 @@ export function BettingEngine() {
           <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
             Historial de ciclos
           </p>
-          {cycles.length > 0 && (
-            <span className="text-xs text-gray-600">{cycles.length} ciclo(s)</span>
-          )}
+          <div className="flex items-center gap-3">
+            {cycles.length > 0 && (
+              <span className="text-xs text-gray-600">{cycles.length} ciclo(s)</span>
+            )}
+            <div className="flex flex-col items-end gap-1">
+              <button
+                onClick={handleRetryCycle}
+                disabled={retrying}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                  retrying
+                    ? 'bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed'
+                    : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-blue-600 hover:text-blue-400 cursor-pointer'
+                }`}
+              >
+                <span className={retrying ? 'animate-spin inline-block' : ''}>🔁</span>
+                {retrying ? 'Solicitando…' : 'Relanzar ciclo'}
+              </button>
+              {retryMsg && (
+                <p className={`text-[10px] ${retryMsg.ok ? 'text-green-400' : 'text-red-400'}`}>
+                  {retryMsg.ok ? '✅' : '❌'} {retryMsg.text}
+                </p>
+              )}
+            </div>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
