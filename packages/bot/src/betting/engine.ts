@@ -28,9 +28,8 @@ const logger = new BotEventLogger('ENGINE')
 // ─── Runner principal ─────────────────────────────────────────────────────────
 
 export async function runBettingCycle(targetDate?: string): Promise<void> {
-  // targetDate permite ejecutar el ciclo para una fecha concreta (útil en tests)
-  const tomorrow   = targetDate ?? format(addDays(new Date(), 1), 'yyyy-MM-dd')
-  const stake      = await getStakeConfig()
+  const tomorrow    = targetDate ?? format(addDays(new Date(), 1), 'yyyy-MM-dd')
+  const stake       = await getStakeConfig()
   const isSimulated = stake.bettingMode !== 'live'
 
   await logger.log('info', 'prediction',
@@ -81,14 +80,13 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     ? Object.fromEntries(sourcesData.map(s => [s.slug, s.weight ?? 0]))
     : {}
 
-  // ── 2. Leer sesgo N desde Supabase ───────────────────────────────────────
+  // ── 2. Leer sesgo N desde Supabase ────────────────────────────────────────
   const biasN = await getCurrentBias()
 
-  // ── 3. Construir ensemble con fuentes registradas ─────────────────────────
+  // ── 3. Ensemble con fuentes registradas ───────────────────────────────────
   const manager     = await setupManager(customWeights)
-  const ensembleRes = await manager.getEnsemble(tomorrow)
-
-  const rawEnsemble = ensembleRes?.ensemble ?? null
+  const ensembleRes = await manager.getEnsembleForecast(tomorrow)  // ✅ firma real
+  const rawEnsemble = ensembleRes.ensembleTemp                      // ✅ campo real
 
   if (!rawEnsemble) {
     await logger.error(`No se pudo obtener ensemble para ${tomorrow}`)
@@ -103,43 +101,43 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     { rawEnsemble, biasN, adjustedEnsemble }
   )
 
-  // ── 5. Obtener precios de Polymarket ─────────────────────────────────────
-  const position = await buildPosition(tomorrow, adjustedEnsemble)
+  // ── 5. Obtener precios de Polymarket ──────────────────────────────────────
+  // Firma real: buildPosition(ensembleTemp: number, targetDate: string)
+  const position = await buildPosition(adjustedEnsemble, tomorrow)  // ✅ orden real
 
-  if (!position) {
-    await logger.error(`No se pudo construir posición para ${tomorrow}`)
-    return
-  }
+  const tokenA = position.tokenA.tempCelsius   // ✅ nombre real
+  const tokenB = position.tokenB.tempCelsius
+  const priceA = position.tokenA.priceAtBuy    // ✅ nombre real
+  const priceB = position.tokenB.priceAtBuy
 
-  const { tokenA, tokenB, priceA, priceB } = position
-
-  // ── 6. Calcular shares ───────────────────────────────────────────────────
+  // ── 6. Calcular stake y shares (Martingala) ───────────────────────────────
   const totalStake = stake.baseStake * stake.multiplier
-  const shares     = priceA + priceB > 0 ? totalStake / (priceA + priceB) : 0
-  const costA      = shares * priceA
-  const costB      = shares * priceB
+  const priceSum   = (priceA ?? 0) + (priceB ?? 0)
+  const shares     = priceSum > 0 ? totalStake / priceSum : 0
+  const costA      = shares * (priceA ?? 0)
+  const costB      = shares * (priceB ?? 0)
 
   // ── 7. Persistir predicción ───────────────────────────────────────────────
   const { data: prediction, error: predError } = await supabase
     .from('predictions')
     .insert({
-      target_date:    tomorrow,
-      predicted_at:   new Date().toISOString(),
-      ensemble_temp:  rawEnsemble,
-      bias_applied:   biasN,
+      target_date:       tomorrow,
+      predicted_at:      new Date().toISOString(),
+      ensemble_temp:     rawEnsemble,
+      bias_applied:      biasN,
       ensemble_adjusted: adjustedEnsemble,
-      source_temps:   ensembleRes?.sourcePredictions ?? {},
-      ensemble_config: customWeights,
-      token_a:        tokenA,
-      token_b:        tokenB,
-      cost_a_usdc:    costA,
-      cost_b_usdc:    costB,
-      stake_usdc:     totalStake,
-      simulated:      isSimulated,
-      settled:        false,
+      source_temps:      ensembleRes.sourceTemps,  // ✅ nombre real
+      ensemble_config:   ensembleRes.weights,
+      opt_weights:       customWeights,
+      token_a:           tokenA,
+      token_b:           tokenB,
+      cost_a_usdc:       costA,
+      cost_b_usdc:       costB,
+      stake_usdc:        totalStake,
+      simulated:         isSimulated,
+      settled:           false,
       comparison_source: false,
-      // Columnas legacy
-      token_low:  null, token_mid:  null, token_high: null,
+      token_low: null, token_mid: null, token_high: null,
       cost_low_usdc: null, cost_mid_usdc: null, cost_high_usdc: null,
     })
     .select()
@@ -156,7 +154,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     .insert([
       {
         prediction_id: prediction.id,
-        slug:          position.slugA,
+        slug:          position.tokenA.slug,  // ✅ nombre real
         token_temp:    tokenA,
         position:      'a',
         cost_usdc:     costA,
@@ -167,7 +165,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       },
       {
         prediction_id: prediction.id,
-        slug:          position.slugB,
+        slug:          position.tokenB.slug,  // ✅ nombre real
         token_temp:    tokenB,
         position:      'b',
         cost_usdc:     costB,
@@ -203,19 +201,18 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   }
 
   // ── 10. Log resumen ───────────────────────────────────────────────────────
-  const signN = biasN >= 0 ? '+' : ''
   await logger.log('success', 'prediction',
     `✅ Ciclo creado — ${tomorrow} | ` +
     `Tokens: ${tokenA}°/${tokenB}° | ` +
     `Stake: $${totalStake.toFixed(2)} (×${stake.multiplier}) | ` +
-    `Precios: ${(priceA * 100).toFixed(0)}¢/${(priceB * 100).toFixed(0)}¢ | ` +
+    `Precios: ${priceA ? (priceA * 100).toFixed(0) : '?'}¢/${priceB ? (priceB * 100).toFixed(0) : '?'}¢ | ` +
     `Modo: ${stake.bettingMode}`,
     {
-      cycleId:       cycle.id,
-      predictionId:  prediction.id,
+      cycleId:      cycle.id,
+      predictionId: prediction.id,
       tokenA, tokenB, priceA, priceB,
-      shares:        parseFloat(shares.toFixed(4)),
-      stake:         totalStake,
+      shares:       parseFloat(shares.toFixed(4)),
+      stake:        totalStake,
       biasN,
     }
   )
@@ -228,10 +225,8 @@ async function logActiveConfig(
   stake: Awaited<ReturnType<typeof getStakeConfig>>,
 ): Promise<void> {
   try {
-    // Leer bias actual
     const biasN = await getCurrentBias()
 
-    // Leer pesos de fuentes activas
     const { data: sourcesData } = await supabase
       .from('weather_sources')
       .select('slug, weight')
@@ -262,7 +257,6 @@ async function logActiveConfig(
       }
     )
   } catch (err) {
-    // No es fatal — el ciclo continúa aunque falle el log de config
     console.error('[ENGINE] Error logueando config activa:', err)
   }
 }
