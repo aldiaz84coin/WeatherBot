@@ -38,6 +38,9 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     { mode: stake.bettingMode }
   )
 
+  // ── LOG: Configuración activa al inicio del ciclo ─────────────────────────
+  await logActiveConfig(tomorrow, stake)
+
   // ── Guard: ¿ya existe ciclo para esta fecha? ──────────────────────────────
   const { data: existingCycle } = await supabase
     .from('betting_cycles')
@@ -64,211 +67,207 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     await logger.log('warn', 'info',
       `Predicción para ${tomorrow} ya existe (id: ${existingPred.id}) — reutilizando`,
     )
-    // Crear el betting_cycle usando la predicción existente
     await createCycleFromExistingPrediction(existingPred.id, tomorrow, stake, isSimulated)
     return
   }
 
-  // ── 1. Stake ──────────────────────────────────────────────────────────────
-  await logger.log('info', 'prediction',
-    `Stake: ${stake.baseStake} USDC × ${stake.multiplier} = ${stake.currentStake} USDC` +
-    (stake.cappedAtMax ? ' ⚠️ TOPE MÁXIMO' : ''),
-    { ...stake }
-  )
+  // ── 1. Leer pesos de fuentes desde Supabase ───────────────────────────────
+  const { data: sourcesData } = await supabase
+    .from('weather_sources')
+    .select('slug, weight')
+    .eq('active', true)
 
-  // ── 2. Pesos del ensemble ─────────────────────────────────────────────────
-  const manager = await setupManager()
+  const customWeights: Record<string, number> = sourcesData
+    ? Object.fromEntries(sourcesData.map(s => [s.slug, s.weight ?? 0]))
+    : {}
 
-  const { data: latestRun } = await supabase
-    .from('training_runs')
-    .select('best_ensemble')
-    .eq('passed', true)
-    .order('run_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  // ── 2. Leer sesgo N desde Supabase ───────────────────────────────────────
+  const biasN = await getCurrentBias()
 
-  const weightsUsed = latestRun?.best_ensemble ?? null
-  if (weightsUsed) {
-    manager.setWeights(weightsUsed)
-    await logger.info(`Pesos cargados del último training_run`, { weightsUsed })
-  } else {
-    await logger.warn(`Sin training_run válido — usando pesos por defecto de weather_sources`)
-  }
+  // ── 3. Construir ensemble con fuentes registradas ─────────────────────────
+  const manager     = await setupManager(customWeights)
+  const ensembleRes = await manager.getEnsemble(tomorrow)
 
-  // ── 3. Predicción de temperatura ─────────────────────────────────────────
-  let sourceTemps: Record<string, number> = {}
-  let ensembleRaw: number
+  const rawEnsemble = ensembleRes?.ensemble ?? null
 
-  try {
-    const forecast = await manager.getEnsembleForecast(tomorrow)
-    sourceTemps    = forecast.sourceTemps
-    ensembleRaw    = forecast.ensembleTemp
-  } catch (err) {
-    await logger.error(`Error obteniendo predicciones de fuentes`, err)
-    // Registrar ciclo con error y abortar
-    await supabase.from('betting_cycles').insert({
-      target_date:     tomorrow,
-      base_stake_usdc: stake.baseStake,
-      multiplier:      stake.multiplier,
-      stake_usdc:      stake.currentStake,
-      capped_at_max:   stake.cappedAtMax,
-      status:          'error',
-      simulated:       isSimulated,
-      source_temps:    {},
-      weights_used:    weightsUsed,
-    })
+  if (!rawEnsemble) {
+    await logger.error(`No se pudo obtener ensemble para ${tomorrow}`)
     return
   }
 
-  // ── 3b. Aplicar sesgo N ───────────────────────────────────────────────────
-  // N = mean(actual - ensemble) calculado diariamente a las 08:00.
-  // ensemble_ajustado = ensemble + N  →  ceil(ensemble_ajustado) = token_a
-  const biasN       = await getCurrentBias()
-  const ensembleTemp = parseFloat((ensembleRaw + biasN).toFixed(4))
-  const nSign        = biasN >= 0 ? '+' : ''
+  // ── 4. Aplicar corrección de sesgo ────────────────────────────────────────
+  const adjustedEnsemble = rawEnsemble + biasN
 
   await logger.log('info', 'prediction',
-    `Ensemble: ${ensembleRaw.toFixed(3)}°C  +  N(${nSign}${biasN.toFixed(3)}°C)  =  ${ensembleTemp.toFixed(3)}°C para ${tomorrow}`,
-    { ensembleRaw, biasN, ensembleTemp, sourceTemps }
+    `Ensemble: ${rawEnsemble.toFixed(2)}°C  +  sesgo N=${biasN >= 0 ? '+' : ''}${biasN}°C  →  ajustado: ${adjustedEnsemble.toFixed(2)}°C`,
+    { rawEnsemble, biasN, adjustedEnsemble }
   )
 
-  // ── 4. Construir posición (con ensemble corregido) ────────────────────────
-  // token_a = ceil(ensemble + N), token_b = ceil(ensemble + N) + 1
-  let position: Awaited<ReturnType<typeof buildPosition>>
+  // ── 5. Obtener precios de Polymarket ─────────────────────────────────────
+  const position = await buildPosition(tomorrow, adjustedEnsemble)
 
-  try {
-    position = await buildPosition(ensembleTemp, tomorrow)
-  } catch (err) {
-    await logger.error(`Error construyendo posición`, err)
-    await supabase.from('betting_cycles').insert({
-      target_date:     tomorrow,
-      base_stake_usdc: stake.baseStake,
-      multiplier:      stake.multiplier,
-      stake_usdc:      stake.currentStake,
-      capped_at_max:   stake.cappedAtMax,
-      ensemble_temp:   ensembleTemp,
-      status:          'error',
-      simulated:       isSimulated,
-      source_temps:    sourceTemps,
-      weights_used:    weightsUsed,
-    })
+  if (!position) {
+    await logger.error(`No se pudo construir posición para ${tomorrow}`)
     return
   }
 
-  // ── 5. Reparto de stake — mismo nº de shares para cada token ─────────────
-  //
-  //   N      = stake / (priceA + priceB)
-  //   costA  = N × priceA
-  //   costB  = N × priceB
-  //   costA + costB ≈ stake  ✓
-  //
-  const priceA = position.tokenA.priceAtBuy ?? 0.5
-  const priceB = position.tokenB.priceAtBuy ?? 0.5
-  const shares = parseFloat((stake.currentStake / (priceA + priceB)).toFixed(6))
-  const costA  = parseFloat((shares * priceA).toFixed(4))
-  const costB  = parseFloat((shares * priceB).toFixed(4))
+  const { tokenA, tokenB, priceA, priceB } = position
 
-  await logger.info(
-    `Posición: ${position.tokenA.tempCelsius}°C (${priceA.toFixed(3)}) + ` +
-    `${position.tokenB.tempCelsius}°C (${priceB.toFixed(3)}) — ` +
-    `${shares.toFixed(4)} shares c/u — total: ${(costA + costB).toFixed(4)} USDC`,
-    { priceA, priceB, shares, costA, costB }
-  )
+  // ── 6. Calcular shares ───────────────────────────────────────────────────
+  const totalStake = stake.baseStake * stake.multiplier
+  const shares     = priceA + priceB > 0 ? totalStake / (priceA + priceB) : 0
+  const costA      = shares * priceA
+  const costB      = shares * priceB
 
-  // ── 6. Guardar predicción en la tabla predictions ─────────────────────────
-  const { data: prediction, error: predErr } = await supabase
+  // ── 7. Persistir predicción ───────────────────────────────────────────────
+  const { data: prediction, error: predError } = await supabase
     .from('predictions')
     .insert({
       target_date:    tomorrow,
       predicted_at:   new Date().toISOString(),
-      ensemble_temp:  parseFloat(ensembleTemp.toFixed(2)),
-      source_temps:   sourceTemps,
-      token_a:        position.tokenA.tempCelsius,
-      token_b:        position.tokenB.tempCelsius,
+      ensemble_temp:  rawEnsemble,
+      bias_applied:   biasN,
+      ensemble_adjusted: adjustedEnsemble,
+      source_temps:   ensembleRes?.sourcePredictions ?? {},
+      ensemble_config: customWeights,
+      token_a:        tokenA,
+      token_b:        tokenB,
       cost_a_usdc:    costA,
       cost_b_usdc:    costB,
-      stake_usdc:     stake.currentStake,
+      stake_usdc:     totalStake,
       simulated:      isSimulated,
-      ensemble_config: weightsUsed,
-      bias_applied:   parseFloat(biasN.toFixed(4)),
+      settled:        false,
+      comparison_source: false,
+      // Columnas legacy
+      token_low:  null, token_mid:  null, token_high: null,
+      cost_low_usdc: null, cost_mid_usdc: null, cost_high_usdc: null,
     })
-    .select('id')
+    .select()
     .single()
 
-  if (predErr || !prediction) {
-    await logger.error(`Error guardando predicción: ${predErr?.message}`)
+  if (predError) {
+    await logger.error(`Error guardando predicción: ${predError.message}`, predError)
     return
   }
 
-  // ── 7. Guardar trades ─────────────────────────────────────────────────────
-  const tokensToInsert = [
-    { token: position.tokenA, slot: 'a', cost: costA },
-    { token: position.tokenB, slot: 'b', cost: costB },
-  ]
+  // ── 8. Persistir trades ───────────────────────────────────────────────────
+  const { error: tradesError } = await supabase
+    .from('trades')
+    .insert([
+      {
+        prediction_id: prediction.id,
+        slug:          position.slugA,
+        token_temp:    tokenA,
+        position:      'a',
+        cost_usdc:     costA,
+        price_at_buy:  priceA,
+        shares,
+        simulated:     isSimulated,
+        status:        'open',
+      },
+      {
+        prediction_id: prediction.id,
+        slug:          position.slugB,
+        token_temp:    tokenB,
+        position:      'b',
+        cost_usdc:     costB,
+        price_at_buy:  priceB,
+        shares,
+        simulated:     isSimulated,
+        status:        'open',
+      },
+    ])
 
-  for (const { token, slot, cost } of tokensToInsert) {
-    const { error: tradeErr } = await supabase.from('trades').insert({
-      prediction_id:  prediction.id,
-      slug:           token.slug,
-      token_temp:     token.tempCelsius,
-      position:       slot,
-      cost_usdc:      cost,
-      price_at_buy:   token.priceAtBuy,
-      shares:         shares,
-      simulated:      isSimulated,
-      status:         'open',
-    })
-    if (tradeErr) {
-      await logger.warn(`Error guardando trade ${slot}: ${tradeErr.message}`)
-    }
+  if (tradesError) {
+    await logger.error(`Error guardando trades: ${tradesError.message}`, tradesError)
+    return
   }
 
-  // ── 8. Crear betting_cycle ────────────────────────────────────────────────
-  const { data: cycle, error: cycleErr } = await supabase
+  // ── 9. Crear betting_cycle ────────────────────────────────────────────────
+  const { data: cycle, error: cycleError } = await supabase
     .from('betting_cycles')
     .insert({
-      target_date:     tomorrow,
-      base_stake_usdc: stake.baseStake,
-      multiplier:      stake.multiplier,
-      stake_usdc:      stake.currentStake,
-      capped_at_max:   stake.cappedAtMax,
-      ensemble_temp:   parseFloat(ensembleTemp.toFixed(2)),
-      token_a_temp:    position.tokenA.tempCelsius,
-      token_b_temp:    position.tokenB.tempCelsius,
-      price_a:         priceA,
-      price_b:         priceB,
-      shares,
-      cost_a_usdc:     costA,
-      cost_b_usdc:     costB,
-      prediction_id:   prediction.id,
-      status:          'open',
-      simulated:       isSimulated,
-      source_temps:    sourceTemps,
-      weights_used:    weightsUsed,
-      bias_applied:    parseFloat(biasN.toFixed(4)),
+      target_date:   tomorrow,
+      prediction_id: prediction.id,
+      stake_usdc:    totalStake,
+      multiplier:    stake.multiplier,
+      status:        'open',
+      simulated:     isSimulated,
     })
-    .select('id')
+    .select()
     .single()
 
-  if (cycleErr || !cycle) {
-    await logger.error(`Error creando betting_cycle: ${cycleErr?.message}`)
+  if (cycleError) {
+    await logger.error(`Error creando betting_cycle: ${cycleError.message}`, cycleError)
     return
   }
 
+  // ── 10. Log resumen ───────────────────────────────────────────────────────
+  const signN = biasN >= 0 ? '+' : ''
   await logger.log('success', 'prediction',
-    `✅ Ciclo abierto para ${tomorrow} — ` +
-    `${position.tokenA.tempCelsius}°C + ${position.tokenB.tempCelsius}°C @ ${shares.toFixed(4)} shares`,
+    `✅ Ciclo creado — ${tomorrow} | ` +
+    `Tokens: ${tokenA}°/${tokenB}° | ` +
+    `Stake: $${totalStake.toFixed(2)} (×${stake.multiplier}) | ` +
+    `Precios: ${(priceA * 100).toFixed(0)}¢/${(priceB * 100).toFixed(0)}¢ | ` +
+    `Modo: ${stake.bettingMode}`,
     {
-      cycleId:  cycle.id,
-      predId:   prediction.id,
-      stake:    stake.currentStake,
-      tokens:   `${position.tokenA.tempCelsius}°C / ${position.tokenB.tempCelsius}°C`,
-    },
-    cycle.id
+      cycleId:       cycle.id,
+      predictionId:  prediction.id,
+      tokenA, tokenB, priceA, priceB,
+      shares:        parseFloat(shares.toFixed(4)),
+      stake:         totalStake,
+      biasN,
+    }
   )
 }
 
-// ─── Reutilizar predicción existente ────────────────────────────────────────
+// ─── Log de configuración activa ─────────────────────────────────────────────
+
+async function logActiveConfig(
+  targetDate: string,
+  stake: Awaited<ReturnType<typeof getStakeConfig>>,
+): Promise<void> {
+  try {
+    // Leer bias actual
+    const biasN = await getCurrentBias()
+
+    // Leer pesos de fuentes activas
+    const { data: sourcesData } = await supabase
+      .from('weather_sources')
+      .select('slug, weight')
+      .eq('active', true)
+      .order('weight', { ascending: false })
+
+    const weightsSummary = (sourcesData ?? [])
+      .map(s => `${s.slug}=${((s.weight ?? 0) * 100).toFixed(0)}%`)
+      .join(', ')
+
+    const signN = biasN >= 0 ? '+' : ''
+
+    await logger.log(
+      'info',
+      'weight_update',
+      `📋 Config activa para ${targetDate}: ` +
+      `bias N=${signN}${biasN.toFixed(1)}°C | ` +
+      `stake base=$${stake.baseStake} ×${stake.multiplier} | ` +
+      `modo=${stake.bettingMode} | ` +
+      `pesos=[${weightsSummary}]`,
+      {
+        targetDate,
+        biasN,
+        baseStake:   stake.baseStake,
+        multiplier:  stake.multiplier,
+        bettingMode: stake.bettingMode,
+        weights:     Object.fromEntries((sourcesData ?? []).map(s => [s.slug, s.weight])),
+      }
+    )
+  } catch (err) {
+    // No es fatal — el ciclo continúa aunque falle el log de config
+    console.error('[ENGINE] Error logueando config activa:', err)
+  }
+}
+
+// ─── Crear ciclo desde predicción existente ───────────────────────────────────
 
 async function createCycleFromExistingPrediction(
   predictionId: string,
@@ -276,78 +275,24 @@ async function createCycleFromExistingPrediction(
   stake:        Awaited<ReturnType<typeof getStakeConfig>>,
   isSimulated:  boolean,
 ): Promise<void> {
-  const { data: pred } = await supabase
-    .from('predictions')
-    .select(`
-      ensemble_temp, token_a, token_b,
-      cost_a_usdc, cost_b_usdc, source_temps, ensemble_config, bias_applied,
-      trades ( position, price_at_buy, shares )
-    `)
-    .eq('id', predictionId)
-    .single()
+  const totalStake = stake.baseStake * stake.multiplier
 
-  if (!pred) {
-    await logger.error(`createCycleFromExistingPrediction: predicción ${predictionId} no encontrada`)
-    return
-  }
-
-  const trades = (pred.trades ?? []) as Array<{ position: string; price_at_buy: number | null; shares: number | null }>
-  const tradeA = trades.find(t => t.position === 'a')
-  const tradeB = trades.find(t => t.position === 'b')
-
-  // Precios desde los trades; si no hay datos de mercado, asumir 0.5
-  const priceA = tradeA?.price_at_buy ?? 0.5
-  const priceB = tradeB?.price_at_buy ?? 0.5
-
-  // Recalcular shares con el stake ACTUAL (puede diferir del original por Martingala)
-  const shares = parseFloat((stake.currentStake / (priceA + priceB)).toFixed(6))
-  const costA  = parseFloat((shares * priceA).toFixed(4))
-  const costB  = parseFloat((shares * priceB).toFixed(4))
-
-  const { data: cycle, error: cycleErr } = await supabase
+  const { error } = await supabase
     .from('betting_cycles')
     .insert({
-      target_date:     tomorrow,
-      base_stake_usdc: stake.baseStake,
-      multiplier:      stake.multiplier,
-      stake_usdc:      stake.currentStake,
-      capped_at_max:   stake.cappedAtMax,
-      ensemble_temp:   pred.ensemble_temp,
-      token_a_temp:    pred.token_a,
-      token_b_temp:    pred.token_b,
-      price_a:         priceA,
-      price_b:         priceB,
-      shares,
-      cost_a_usdc:     costA,
-      cost_b_usdc:     costB,
-      prediction_id:   predictionId,
-      status:          'open',
-      simulated:       isSimulated,
-      source_temps:    pred.source_temps,
-      weights_used:    pred.ensemble_config,
-      bias_applied:    pred.bias_applied ?? null,
+      target_date:   tomorrow,
+      prediction_id: predictionId,
+      stake_usdc:    totalStake,
+      multiplier:    stake.multiplier,
+      status:        'open',
+      simulated:     isSimulated,
     })
-    .select('id')
-    .single()
 
-  if (cycleErr || !cycle) {
-    await logger.error(`Error creando cycle desde predicción existente: ${cycleErr?.message}`)
-    return
+  if (error) {
+    await logger.error(`Error creando cycle desde predicción existente: ${error.message}`, error)
+  } else {
+    await logger.log('success', 'prediction',
+      `✅ Ciclo creado desde predicción existente — ${tomorrow} | Stake: $${totalStake} (×${stake.multiplier})`
+    )
   }
-
-  await logger.log('success', 'prediction',
-    `✅ Ciclo abierto (predicción reutilizada) para ${tomorrow} — ` +
-    `${pred.token_a}°C + ${pred.token_b}°C @ ${shares.toFixed(4)} shares`,
-    { cycleId: cycle.id, predId: predictionId, stake: stake.currentStake, priceA, priceB, shares },
-    cycle.id
-  )
-}
-
-// ─── Entrypoint directo ───────────────────────────────────────────────────────
-
-if (require.main === module) {
-  runBettingCycle().catch(err => {
-    console.error('Fatal en runBettingCycle:', err)
-    process.exit(1)
-  })
 }
