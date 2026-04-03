@@ -185,12 +185,13 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   const { data: cycle, error: cycleError } = await supabase
     .from('betting_cycles')
     .insert({
-      target_date:   tomorrow,
-      prediction_id: prediction.id,
-      stake_usdc:    totalStake,
-      multiplier:    stake.multiplier,
-      status:        'open',
-      simulated:     isSimulated,
+      target_date:     tomorrow,
+      prediction_id:   prediction.id,
+      base_stake_usdc: stake.baseStake,  // ← requerido NOT NULL
+      stake_usdc:      totalStake,
+      multiplier:      stake.multiplier,
+      status:          'open',
+      simulated:       isSimulated,
     })
     .select()
     .single()
@@ -274,12 +275,13 @@ async function createCycleFromExistingPrediction(
   const { error } = await supabase
     .from('betting_cycles')
     .insert({
-      target_date:   tomorrow,
-      prediction_id: predictionId,
-      stake_usdc:    totalStake,
-      multiplier:    stake.multiplier,
-      status:        'open',
-      simulated:     isSimulated,
+      target_date:     tomorrow,
+      prediction_id:   predictionId,
+      base_stake_usdc: stake.baseStake,  // ← requerido NOT NULL
+      stake_usdc:      totalStake,
+      multiplier:      stake.multiplier,
+      status:          'open',
+      simulated:       isSimulated,
     })
 
   if (error) {
