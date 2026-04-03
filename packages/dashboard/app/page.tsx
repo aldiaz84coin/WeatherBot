@@ -3,15 +3,13 @@
 
 import { createClient } from '@supabase/supabase-js'
 import { getPerformance, getDailySummaries, getLatestTrainingRun } from '../lib/supabase'
-import { BotStatus }       from '../components/BotStatus'
-import { PredictionCard }  from '../components/PredictionCard'
-import { PnlChart }        from '../components/PnlChart'
-import { TrainingResults } from '../components/TrainingResults'
+import { BotStatus }        from '../components/BotStatus'
+import { PredictionCard }   from '../components/PredictionCard'
+import { PnlChart }         from '../components/PnlChart'
+import { TrainingResults }  from '../components/TrainingResults'
 import { WeightsBiasPanel } from '../components/WeightsBiasPanel'
 
 export const revalidate = 60
-
-// ── Helpers de datos ──────────────────────────────────────────────────────────
 
 function getSupabase() {
   return createClient(
@@ -38,24 +36,21 @@ async function getWeightsAndBias() {
       .maybeSingle(),
   ])
 
-  const meta    = lastEvent?.metadata as Record<string, unknown> | null
-  const biasN   = (meta?.biasN   as number | undefined) ?? null
-  const updated = lastEvent?.created_at ?? null
+  const meta  = lastEvent?.metadata as Record<string, unknown> | null
+  const biasN = (meta?.biasN as number | undefined) ?? null
 
   return {
     weights:   sources ?? [],
     biasN,
-    updatedAt: updated,
+    updatedAt: lastEvent?.created_at ?? null,
   }
 }
-
-// ── Página ────────────────────────────────────────────────────────────────────
 
 export default async function HomePage() {
   const [perf, summaries, latestRun, { weights, biasN, updatedAt }] = await Promise.all([
     getPerformance(),
     getDailySummaries(60),
-    getLatestTrainingRun(),   // tipo TrainingRun | null — compatible con BotStatus
+    getLatestTrainingRun(),
     getWeightsAndBias(),
   ])
 
@@ -64,7 +59,6 @@ export default async function HomePage() {
   return (
     <div className="space-y-6">
 
-      {/* Header */}
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-white">Overview</h1>
@@ -75,14 +69,8 @@ export default async function HomePage() {
         <BotStatus isLive={isLive} latestRun={latestRun} />
       </div>
 
-      {/* Configuración activa del bot */}
-      <WeightsBiasPanel
-        weights={weights}
-        biasN={biasN}
-        updatedAt={updatedAt}
-      />
+      <WeightsBiasPanel weights={weights} biasN={biasN} updatedAt={updatedAt} />
 
-      {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <PredictionCard
           label="Hit Rate"
@@ -109,7 +97,6 @@ export default async function HomePage() {
         />
       </div>
 
-      {/* Gráfico P&L */}
       {summaries && summaries.length > 0 && (
         <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h2 className="text-sm font-medium text-gray-300 mb-4">P&L acumulado</h2>
@@ -117,13 +104,10 @@ export default async function HomePage() {
         </section>
       )}
 
-      {/* Tabla de predicciones recientes */}
       <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-medium text-gray-300">Últimas predicciones</h2>
-          <a href="/predictions" className="text-xs text-blue-400 hover:text-blue-300">
-            Ver todas →
-          </a>
+          <a href="/predictions" className="text-xs text-blue-400 hover:text-blue-300">Ver todas →</a>
         </div>
         <TrainingResults summaries={summaries?.slice(0, 10) ?? []} />
       </section>
