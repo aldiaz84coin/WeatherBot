@@ -3,6 +3,9 @@
 // Escribe el bias recomendado por la IA en bot_config[prediction_bias_n].
 // El bot lo leerá en el próximo ciclo de apuesta (00:30) a través de
 // getCurrentBias() en bias-optimizer.ts.
+//
+// También registra el cambio en bot_events para que sea visible en el
+// dashboard y el bot pueda confirmar que el valor persiste.
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -11,11 +14,19 @@ import { createClient } from '@supabase/supabase-js'
 export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
+  // ── Variables de entorno compatibles con Vercel y Railway ─────────────────
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL ?? ''
+  const supabaseKey = process.env.SUPABASE_SERVICE_KEY     ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''
+
+  if (!supabaseUrl || !supabaseKey) {
+    return NextResponse.json(
+      { error: 'Variables de entorno de Supabase no configuradas' },
+      { status: 500 },
+    )
+  }
+
   // Cliente inicializado dentro del handler para evitar errores en build time
-  const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!,
-  )
+  const supabase = createClient(supabaseUrl, supabaseKey)
 
   try {
     const { bias } = await req.json()
@@ -28,45 +39,72 @@ export async function POST(req: NextRequest) {
     }
 
     const rounded = Math.round(bias * 10) / 10  // 1 decimal
+    const now     = new Date().toISOString()
 
-    // Guardar N previo antes de sobreescribir
+    // ── 1. Leer N previo antes de sobreescribir ───────────────────────────────
     const { data: current } = await supabase
       .from('bot_config')
       .select('value')
       .eq('key', 'prediction_bias_n')
       .maybeSingle()
 
-    const prevN = current?.value ?? 0
+    const prevN = typeof current?.value === 'number' ? current.value : Number(current?.value ?? 0)
 
-    await supabase
+    // ── 2. Backup del N previo ─────────────────────────────────────────────────
+    const { error: prevErr } = await supabase
       .from('bot_config')
       .upsert(
         {
           key:         'prediction_bias_prev_n',
           value:       prevN,
           description: 'Sesgo N del ciclo anterior (backup automático)',
-          updated_at:  new Date().toISOString(),
+          updated_at:  now,
         },
         { onConflict: 'key' },
       )
 
+    if (prevErr) {
+      console.error('[apply-bias] Error guardando prevN:', prevErr)
+    }
+
+    // ── 3. Guardar nuevo N ────────────────────────────────────────────────────
     const { error } = await supabase
       .from('bot_config')
       .upsert(
         {
           key:         'prediction_bias_n',
           value:       rounded,
-          description: `Sesgo N aplicado al ensemble (°C) — actualizado por IA el ${new Date().toISOString()}`,
-          updated_at:  new Date().toISOString(),
+          description: `Sesgo N aplicado al ensemble (°C) — actualizado por IA el ${now}`,
+          updated_at:  now,
         },
         { onConflict: 'key' },
       )
 
     if (error) throw error
 
+    // ── 4. Registrar en bot_events para confirmación visual ───────────────────
+    const sign     = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(1)
+    const deltaStr = sign(rounded - prevN)
+
+    await supabase
+      .from('bot_events')
+      .insert({
+        level:     'success',
+        category:  'weight_update',
+        message:   `[AI Optimizer] Bias actualizado: ${sign(prevN)}°C → ${sign(rounded)}°C (Δ ${deltaStr}°C). Efectivo en el próximo ciclo (00:30).`,
+        metadata:  {
+          source:   'ai_optimizer',
+          prevBias: prevN,
+          newBias:  rounded,
+          delta:    rounded - prevN,
+        },
+        created_at: now,
+      })
+
     return NextResponse.json({ ok: true, bias: rounded, prevBias: prevN })
 
   } catch (err: any) {
+    console.error('[apply-bias] Error:', err)
     return NextResponse.json(
       { error: err.message ?? 'Error interno' },
       { status: 500 },
