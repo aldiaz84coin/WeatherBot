@@ -290,7 +290,8 @@ export function BettingEngine() {
             token_a_temp, token_b_temp, status, simulated, prediction_id,
             predictions (
               ensemble_temp, ensemble_adjusted, bias_applied,
-              cost_a_usdc, cost_b_usdc
+              cost_a_usdc, cost_b_usdc,
+              token_a, token_b
             )
           `)
           .eq('target_date', tomorrowStr)
@@ -310,8 +311,8 @@ export function BettingEngine() {
           target_date:       tmw.target_date,
           stake_usdc:        tmw.stake_usdc,
           multiplier:        tmw.multiplier,
-          token_a_temp:      tmw.token_a_temp,
-          token_b_temp:      tmw.token_b_temp,
+          token_a_temp:      tmw.token_a_temp ?? pred?.token_a ?? null,   // fallback a predictions.token_a
+          token_b_temp:      tmw.token_b_temp ?? pred?.token_b ?? null,   // fallback a predictions.token_b
           status:            tmw.status,
           simulated:         tmw.simulated,
           prediction_id:     tmw.prediction_id,
