@@ -1,25 +1,79 @@
-// app/page.tsx
-// Overview principal: estado del bot, KPIs y últimas predicciones
+// packages/dashboard/app/page.tsx
+// Overview principal: estado del bot, KPIs, configuración activa y últimas predicciones
 
-import { getPerformance, getDailySummaries, getLatestTrainingRun } from '../lib/supabase'
-import { BotStatus } from '../components/BotStatus'
-import { PredictionCard } from '../components/PredictionCard'
-import { PnlChart } from '../components/PnlChart'
+import { createClient } from '@supabase/supabase-js'
+import { getPerformance, getDailySummaries } from '../lib/supabase'
+import { BotStatus }       from '../components/BotStatus'
+import { PredictionCard }  from '../components/PredictionCard'
+import { PnlChart }        from '../components/PnlChart'
 import { TrainingResults } from '../components/TrainingResults'
+import { WeightsBiasPanel } from '../components/WeightsBiasPanel'
 
-export const revalidate = 60 // revalidar cada 60s
+export const revalidate = 60
+
+// ── Helpers de datos ──────────────────────────────────────────────────────────
+
+function getSupabase() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+
+async function getWeightsAndBias() {
+  const supabase = getSupabase()
+
+  const [{ data: sources }, { data: lastEvent }] = await Promise.all([
+    supabase
+      .from('weather_sources')
+      .select('slug, name, weight, updated_at')
+      .eq('active', true)
+      .order('weight', { ascending: false }),
+    supabase
+      .from('bot_events')
+      .select('metadata, created_at')
+      .eq('category', 'weight_update')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ])
+
+  const meta    = lastEvent?.metadata as Record<string, unknown> | null
+  const biasN   = (meta?.biasN   as number | undefined) ?? null
+  const updated = lastEvent?.created_at ?? null
+
+  return {
+    weights:   sources ?? [],
+    biasN,
+    updatedAt: updated,
+  }
+}
+
+async function getLatestTrainingRun() {
+  const supabase = getSupabase()
+  const { data } = await supabase
+    .from('training_runs')
+    .select('run_at, hit_rate, days_tested, passed, notes')
+    .order('run_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  return data
+}
+
+// ── Página ────────────────────────────────────────────────────────────────────
 
 export default async function HomePage() {
-  const [perf, summaries, latestRun] = await Promise.all([
+  const [perf, summaries, latestRun, { weights, biasN, updatedAt }] = await Promise.all([
     getPerformance(),
     getDailySummaries(60),
     getLatestTrainingRun(),
+    getWeightsAndBias(),
   ])
 
   const isLive = process.env.NEXT_PUBLIC_LIVE_TRADING === 'true'
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
 
       {/* Header */}
       <div className="flex items-start justify-between">
@@ -32,12 +86,19 @@ export default async function HomePage() {
         <BotStatus isLive={isLive} latestRun={latestRun} />
       </div>
 
+      {/* Configuración activa del bot */}
+      <WeightsBiasPanel
+        weights={weights}
+        biasN={biasN}
+        updatedAt={updatedAt}
+      />
+
       {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <PredictionCard
           label="Hit Rate"
           value={perf ? `${perf.hit_rate_pct}%` : '—'}
-          sublabel="objetivo ≥ 90%"
+          sublabel="operaciones resueltas"
           highlight={perf ? parseFloat(perf.hit_rate_pct) >= 90 : false}
         />
         <PredictionCard
@@ -58,48 +119,6 @@ export default async function HomePage() {
           positive={perf ? Number(perf.avg_daily_pnl) >= 0 : undefined}
         />
       </div>
-
-      {/* Fase 1: estado del entrenamiento */}
-      {latestRun && (
-        <section className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-medium text-gray-300">
-              ⭐ Fase 1 — Último entrenamiento
-            </h2>
-            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-              latestRun.passed
-                ? 'bg-green-950 text-green-400 border border-green-800'
-                : 'bg-yellow-950 text-yellow-400 border border-yellow-800'
-            }`}>
-              {latestRun.passed ? '✅ Superado' : '⏳ En progreso'}
-            </span>
-          </div>
-          <div className="grid grid-cols-3 gap-4 text-sm">
-            <div>
-              <p className="text-gray-500 text-xs">Hit rate conseguido</p>
-              <p className="text-white font-medium mt-0.5">
-                {(latestRun.hit_rate * 100).toFixed(1)}%
-                <span className="text-gray-500 text-xs ml-1">/ objetivo 90%</span>
-              </p>
-            </div>
-            <div>
-              <p className="text-gray-500 text-xs">Días de backtest</p>
-              <p className="text-white font-medium mt-0.5">{latestRun.days_tested}</p>
-            </div>
-            <div>
-              <p className="text-gray-500 text-xs">Ejecutado</p>
-              <p className="text-white font-medium mt-0.5">
-                {new Date(latestRun.run_at).toLocaleDateString('es-ES')}
-              </p>
-            </div>
-          </div>
-          {latestRun.notes && (
-            <p className="text-gray-500 text-xs mt-3 border-t border-gray-800 pt-3">
-              {latestRun.notes}
-            </p>
-          )}
-        </section>
-      )}
 
       {/* Gráfico P&L */}
       {summaries && summaries.length > 0 && (
