@@ -18,6 +18,7 @@ import { format, addDays } from 'date-fns'
 import { supabase }        from '../db/supabase'
 import { BotEventLogger }  from './logger'
 import { getStakeConfig, getConfigValue, setConfigValue } from './config'
+import { getCurrentBias } from './bias-optimizer'
 import { ClobClient }      from '../polymarket/clob'
 
 const logger = new BotEventLogger('LIVE-SWITCH')
@@ -219,17 +220,16 @@ async function logLiveModeConfig(
   stake: Awaited<ReturnType<typeof getStakeConfig>>
 ): Promise<void> {
   try {
-    const [sourcesRes, biasRaw] = await Promise.all([
+    const [sourcesRes, biasN] = await Promise.all([
       supabase
         .from('weather_sources')
         .select('slug, weight, active')
         .eq('active', true)
         .order('weight', { ascending: false }),
-      getConfigValue<number>('bias_n'),
+      getCurrentBias(),
     ])
 
     const sources = sourcesRes.data ?? []
-    const biasN   = Number(biasRaw ?? 0)
     const signN   = biasN >= 0 ? '+' : ''
 
     const weightsSummary = sources
