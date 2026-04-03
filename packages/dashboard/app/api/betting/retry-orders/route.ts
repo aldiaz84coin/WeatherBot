@@ -15,14 +15,18 @@ function getSupabase() {
   )
 }
 
+// Calcula "mañana" en hora de Madrid para que coincida con el bot (Railway TZ = Europe/Madrid)
+function getMadridTomorrow(): string {
+  const todayMadrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid' }).format(new Date())
+  const [y, m, d] = todayMadrid.split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10)
+}
+
 export async function POST() {
-  const supabase = getSupabase()
+  const supabase    = getSupabase()
+  const tomorrowStr = getMadridTomorrow()
 
-  // Buscar ciclo abierto para mañana
-  const tomorrow = new Date()
-  tomorrow.setDate(tomorrow.getDate() + 1)
-  const tomorrowStr = tomorrow.toISOString().slice(0, 10)
-
+  // Buscar ciclo abierto para mañana (hora Madrid)
   const { data: cycle } = await supabase
     .from('betting_cycles')
     .select('id, prediction_id, token_a_temp, token_b_temp, stake_usdc')
@@ -51,11 +55,11 @@ export async function POST() {
   }
 
   return NextResponse.json({
-    ok:          true,
-    message:     'Órdenes se reenviarán en los próximos 30 segundos.',
-    targetDate:  tomorrowStr,
-    cycleId:     cycle.id,
-    tokens:      `${cycle.token_a_temp}°C / ${cycle.token_b_temp}°C`,
-    stake:       cycle.stake_usdc,
+    ok:      true,
+    message: 'Órdenes se reenviarán en los próximos 30 segundos.',
+    targetDate: tomorrowStr,
+    cycleId:    cycle.id,
+    tokens:     `${cycle.token_a_temp}°C / ${cycle.token_b_temp}°C`,
+    stake:      cycle.stake_usdc,
   })
 }
