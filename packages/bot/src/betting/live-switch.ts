@@ -333,27 +333,34 @@ async function cancelSimulatedCycle(tomorrow: string): Promise<void> {
   }
 
   // Cancelar trades del ciclo simulado
-  const { error: tradesErr } = await supabase
-    .from('trades')
-    .update({ status: 'cancelled' })
-    .eq('prediction_id', cycle.prediction_id)
-    .eq('simulated', true)
-    .eq('status', 'open')
 
-  if (tradesErr) {
-    await logger.error(`Error cancelando trades simulados: ${tradesErr.message}`, tradesErr)
-  }
+// Eliminar trades del ciclo simulado (FK antes que la predicción)
+const { error: tradesErr } = await supabase
+  .from('trades')
+  .delete()
+  .eq('prediction_id', cycle.prediction_id)
+  .eq('simulated', true)
 
-  // Marcar predicción simulada como settled para que no interfiera
-  const { error: predErr } = await supabase
+if (tradesErr) {
+  await logger.error(`Error eliminando trades simulados: ${tradesErr.message}`, tradesErr)
+}
+
+// Eliminar la predicción para liberar el UNIQUE(target_date)
+const { error: predErr } = await supabase
+  .from('predictions')
+  .delete()
+  .eq('id', cycle.prediction_id)
+  .eq('simulated', true)
+
+if (predErr) {
+  // Fallback: si hay FK a results no se puede borrar, renombrar la fecha
+  await logger.warn(`No se pudo eliminar predicción simulada: ${predErr.message}`)
+  await supabase
     .from('predictions')
     .update({ settled: true })
     .eq('id', cycle.prediction_id)
-
-  if (predErr) {
-    await logger.error(`Error marcando predicción simulada: ${predErr.message}`, predErr)
-  }
-
+}
+  
   // Marcar ciclo como skipped
   const { error: cycleUpdateErr } = await supabase
     .from('betting_cycles')
