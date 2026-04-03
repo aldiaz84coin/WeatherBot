@@ -1,38 +1,38 @@
-'use client'
 // packages/dashboard/components/AIOptimizer.tsx
+'use client'
 
 import { useState, useEffect, useCallback } from 'react'
 import type { AIOptimizerResult } from '../types/ai-optimizer'
 
-// ─── Helpers de estilo ────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const pct = (n: number) => `${Math.round(n * 100)}%`
-const flt = (n: number, d = 3) => n.toFixed(d)
-const sign = (n: number) => (n >= 0 ? '+' : '') + flt(n, 1)
-
-function hitRateColor(rate: number) {
-  if (rate >= 70) return 'text-green-400'
-  if (rate >= 55) return 'text-yellow-400'
-  return 'text-red-400'
-}
+const sign  = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(1)
+const flt   = (v: number, d = 2) => v.toFixed(d)
+const pct   = (v: number) => `${Math.round(v * 100)}%`
 
 function maeDot(mae: number) {
-  if (mae < 1)   return 'bg-green-500'
-  if (mae < 1.5) return 'bg-yellow-500'
+  if (mae < 0.5) return 'bg-green-500'
+  if (mae < 1.0) return 'bg-yellow-500'
   return 'bg-red-500'
 }
 
-// ─── Subcomponente: barra de bias ─────────────────────────────────────────────
+function hitRateColor(hr: number) {
+  if (hr >= 70) return 'text-green-400'
+  if (hr >= 50) return 'text-yellow-400'
+  return 'text-red-400'
+}
+
+// ─── BiasBar ─────────────────────────────────────────────────────────────────
 
 function BiasBar({
   bias, hitRate, isOptimal, current,
-}: {
-  bias: number; hitRate: number; isOptimal: boolean; current: boolean
-}) {
-  const width = `${Math.max(4, hitRate)}%`
+}: { bias: number; hitRate: number; isOptimal: boolean; current: boolean }) {
+  const max   = 100
+  const width = `${Math.min((hitRate / max) * 100, 100)}%`
   return (
     <div className="flex items-center gap-2 text-xs">
-      <span className={`w-10 text-right tabular-nums ${isOptimal ? 'text-blue-300 font-semibold' : 'text-gray-500'}`}>
+      <span className={`w-10 tabular-nums text-right ${
+        isOptimal ? 'text-blue-300 font-semibold' : 'text-gray-500'}`}>
         {sign(bias)}°C
       </span>
       <div className="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
@@ -62,6 +62,8 @@ export function AIOptimizer() {
   const [lookback, setLookback] = useState(60)
   const [applying, setApplying] = useState(false)
   const [applied,  setApplied]  = useState<string | null>(null)
+  // Detalle de lo aplicado para feedback visual
+  const [applyDetail, setApplyDetail] = useState<string | null>(null)
 
   // ── Cargar último resultado cacheado al montar ──────────────────────────────
   const loadCached = useCallback(async () => {
@@ -83,7 +85,7 @@ export function AIOptimizer() {
 
   // ── Ejecutar optimización ────────────────────────────────────────────────────
   const runOptimizer = useCallback(async () => {
-    setLoading(true); setError(null); setApplied(null)
+    setLoading(true); setError(null); setApplied(null); setApplyDetail(null)
     try {
       const res = await fetch('/api/ai-optimizer', {
         method:  'POST',
@@ -105,7 +107,7 @@ export function AIOptimizer() {
   // ── Aplicar pesos recomendados → /api/sources (PATCH) ──────────────────────
   const applyWeights = useCallback(async () => {
     if (!result?.weightRecommendations.weights) return
-    setApplying(true)
+    setApplying(true); setError(null); setApplyDetail(null)
     try {
       const slugMap: Record<string, string> = {
         open_meteo:      'open-meteo',
@@ -124,8 +126,16 @@ export function AIOptimizer() {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ sources: sourcesUpdate }),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? `HTTP ${res.status}`)
+      }
+      const summary = sourcesUpdate
+        .sort((a, b) => b.weight - a.weight)
+        .map(s => `${s.slug} ${Math.round(s.weight * 100)}%`)
+        .join(' · ')
       setApplied('weights')
+      setApplyDetail(`✓ Pesos guardados en Supabase — efectivos en el próximo ciclo (00:30)\n${summary}`)
     } catch (e: any) {
       setError(`Error aplicando pesos: ${e.message}`)
     } finally {
@@ -136,15 +146,26 @@ export function AIOptimizer() {
   // ── Aplicar bias recomendado ─────────────────────────────────────────────────
   const applyBias = useCallback(async () => {
     if (result?.bettingRecommendations.optimalBias == null) return
-    setApplying(true)
+    setApplying(true); setError(null); setApplyDetail(null)
     try {
       const res = await fetch('/api/ai-optimizer/apply-bias', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ bias: result.bettingRecommendations.optimalBias }),
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const json = await res.json()
+      if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`)
+
+      const { bias, prevBias } = json
+      const delta = bias - (prevBias ?? 0)
+      const signN = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(1)
+
       setApplied('bias')
+      setApplyDetail(
+        `✓ Bias guardado en Supabase — efectivo en el próximo ciclo (00:30)\n` +
+        `${signN(prevBias ?? 0)}°C → ${signN(bias)}°C (Δ ${signN(delta)}°C) · ` +
+        `Hit rate esperado: ${result.bettingRecommendations.expectedHitRate.toFixed(1)}%`
+      )
     } catch (e: any) {
       setError(`Error aplicando bias: ${e.message}`)
     } finally {
@@ -157,107 +178,92 @@ export function AIOptimizer() {
   const bd = b?.biasDistribution ?? []
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      {/* ── Controles ──────────────────────────────────────────────────────── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+        <h2 className="text-white font-semibold text-sm">🤖 Optimizador IA — Pesos & Bias</h2>
 
-      {/* ── Header + controles ───────────────────────────────────────────── */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
-          <div className="flex-1">
-            <h2 className="text-white font-semibold text-sm flex items-center gap-2">
-              🤖 Optimizador IA
-            </h2>
-            <p className="text-gray-500 text-xs mt-0.5">
-              Usa Claude para recalibrar pesos de fuentes y offset de apuesta
-            </p>
+        <div className="flex flex-wrap gap-3">
+          {/* Modo */}
+          <div className="space-y-1">
+            <p className="text-gray-500 text-xs">Modo</p>
+            <div className="flex gap-1">
+              {(['full', 'weights', 'bias'] as const).map(m => (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  className={`text-xs px-3 py-1.5 rounded-lg transition-colors ${
+                    mode === m
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {m === 'full' ? '🔀 Completo' : m === 'weights' ? '⚖️ Pesos' : '🎯 Bias'}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <div className="flex flex-wrap gap-2 items-center">
-            <select
-              value={mode}
-              onChange={e => setMode(e.target.value as any)}
-              className="bg-gray-800 border border-gray-700 text-gray-300 text-xs rounded-lg px-3 py-2"
-            >
-              <option value="full">Análisis completo</option>
-              <option value="weights">Solo pesos</option>
-              <option value="bias">Solo bias/apuesta</option>
-            </select>
-
-            <select
-              value={lookback}
-              onChange={e => setLookback(Number(e.target.value))}
-              className="bg-gray-800 border border-gray-700 text-gray-300 text-xs rounded-lg px-3 py-2"
-            >
-              <option value={20}>Últimos 20 días</option>
-              <option value={30}>Últimos 30 días</option>
-              <option value={60}>Últimos 60 días</option>
-              <option value={90}>Últimos 90 días</option>
-            </select>
-
-            <button
-              onClick={runOptimizer}
-              disabled={loading}
-              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50
-                         text-white text-xs font-medium px-4 py-2 rounded-lg transition-colors"
-            >
-              {loading ? (
-                <>
-                  <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Analizando…
-                </>
-              ) : (
-                <>✦ Optimizar</>
-              )}
-            </button>
+          {/* Lookback */}
+          <div className="space-y-1">
+            <p className="text-gray-500 text-xs">Ventana histórica</p>
+            <div className="flex gap-1">
+              {[30, 60, 90].map(d => (
+                <button
+                  key={d}
+                  onClick={() => setLookback(d)}
+                  className={`text-xs px-3 py-1.5 rounded-lg transition-colors ${
+                    lookback === d
+                      ? 'bg-gray-600 text-white'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {d}d
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
+        <button
+          onClick={runOptimizer}
+          disabled={loading}
+          className="w-full bg-blue-700 hover:bg-blue-600 disabled:opacity-50
+                     text-white text-sm font-medium py-2.5 rounded-xl transition-colors"
+        >
+          {loading ? '⏳ Analizando datos con IA…' : '▶ Ejecutar optimización'}
+        </button>
+
         {error && (
-          <p className="mt-3 text-red-400 text-xs bg-red-950/40 border border-red-900 rounded-lg px-3 py-2">
+          <div className="bg-red-950 border border-red-800 text-red-400 text-xs px-4 py-3 rounded-lg">
             {error}
-          </p>
+          </div>
+        )}
+
+        {/* Feedback de aplicación ─────────────────────────────────────────── */}
+        {applyDetail && (
+          <div className="bg-green-950 border border-green-800 text-green-300 text-xs px-4 py-3 rounded-lg whitespace-pre-line">
+            {applyDetail}
+            <p className="text-green-600 mt-1.5">
+              El evento queda registrado en el log del bot (pestaña Betting → Eventos).
+            </p>
+          </div>
         )}
       </div>
 
-      {/* ── Sin resultados todavía ───────────────────────────────────────── */}
-      {!result && !loading && (
-        <div className="bg-gray-900 border border-dashed border-gray-700 rounded-xl p-8 text-center">
-          <p className="text-gray-600 text-sm">
-            Pulsa <strong className="text-gray-400">✦ Optimizar</strong> para que la IA analice
-            el historial y proponga ajustes.
-          </p>
-        </div>
-      )}
-
-      {/* ── Resultados ──────────────────────────────────────────────────── */}
       {result && (
         <>
-          {/* KPIs globales */}
-          <div className="grid grid-cols-3 gap-3">
-            {[
-              { label: 'Ciclos analizados', value: result.cyclesAnalyzed },
-              { label: 'Hit rate histórico', value: `${result.hitRate}%`,
-                cls: hitRateColor(result.hitRate) },
-              { label: 'Generado', value: new Date(result.generatedAt)
-                .toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }) },
-            ].map(k => (
-              <div key={k.label} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-                <p className="text-xs text-gray-600 mb-1">{k.label}</p>
-                <p className={`text-lg font-mono font-semibold ${(k as any).cls ?? 'text-white'}`}>
-                  {k.value}
-                </p>
-              </div>
-            ))}
-          </div>
-
-          {/* ── Sección 1: Pesos ────────────────────────────────────────── */}
+          {/* ── Sección 1: Pesos de fuentes ─────────────────────────────── */}
           {w && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-white font-medium text-sm">📊 Pesos recomendados por fuente</h3>
+                <h3 className="text-white font-medium text-sm">⚖️ Pesos recomendados por fuente</h3>
                 <div className="flex items-center gap-2">
-                  {w.improvedVsPrev !== null && (
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${
-                      w.improvedVsPrev > 0 ? 'bg-green-950 text-green-400' : 'bg-red-950 text-red-400'
+                  {w.improvedVsPrev !== 0 && (
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${
+                      w.improvedVsPrev > 0
+                        ? 'bg-green-950 text-green-400'
+                        : 'bg-red-950 text-red-400'
                     }`}>
                       {w.improvedVsPrev > 0 ? '↓' : '↑'} MAE {Math.abs(w.improvedVsPrev).toFixed(3)}°C
                     </span>
@@ -282,7 +288,10 @@ export function AIOptimizer() {
                       <div key={src} className="flex items-center gap-3 text-xs">
                         <span className="w-24 text-gray-400 truncate">{src}</span>
                         <div className="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
-                          <div className="h-full bg-blue-500 rounded-full" style={{ width: pct(weight) }} />
+                          <div
+                            className="h-full bg-blue-500 rounded-full"
+                            style={{ width: pct(weight) }}
+                          />
                         </div>
                         <span className="w-10 text-right text-white font-mono tabular-nums">
                           {Math.round(weight * 100)}%
@@ -349,7 +358,9 @@ export function AIOptimizer() {
 
               {bd.length > 0 && (
                 <div className="space-y-1.5">
-                  <p className="text-xs text-gray-600 mb-2">Simulación de hit rate por valor de bias:</p>
+                  <p className="text-xs text-gray-600 mb-2">
+                    Simulación de hit rate por valor de bias:
+                  </p>
                   {bd.map(row => (
                     <BiasBar
                       key={row.bias}
@@ -368,31 +379,18 @@ export function AIOptimizer() {
 
           {/* ── Insights y warnings ──────────────────────────────────────── */}
           {((result.insights?.length ?? 0) > 0 || (result.warnings?.length ?? 0) > 0) && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {result.insights?.length > 0 && (
-                <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-                  <h4 className="text-xs font-medium text-gray-400 mb-2">💡 Insights</h4>
-                  <ul className="space-y-1.5">
-                    {result.insights.map((ins, i) => (
-                      <li key={i} className="text-xs text-gray-500 flex gap-1.5">
-                        <span className="text-blue-600 mt-0.5">•</span>{ins}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {result.warnings?.length > 0 && (
-                <div className="bg-gray-900 border border-yellow-900/40 rounded-xl p-4">
-                  <h4 className="text-xs font-medium text-yellow-600 mb-2">⚠️ Avisos</h4>
-                  <ul className="space-y-1.5">
-                    {result.warnings.map((w, i) => (
-                      <li key={i} className="text-xs text-yellow-700 flex gap-1.5">
-                        <span className="mt-0.5">•</span>{w}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
+              <h3 className="text-white font-medium text-sm">💡 Insights y advertencias</h3>
+              {result.insights?.map((ins, i) => (
+                <p key={i} className="text-gray-400 text-xs flex gap-2">
+                  <span className="text-blue-400">›</span> {ins}
+                </p>
+              ))}
+              {result.warnings?.map((w, i) => (
+                <p key={i} className="text-yellow-500 text-xs flex gap-2">
+                  <span>⚠</span> {w}
+                </p>
+              ))}
             </div>
           )}
         </>
