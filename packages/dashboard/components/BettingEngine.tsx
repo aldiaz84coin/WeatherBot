@@ -163,10 +163,10 @@ export function BettingEngine() {
     setRetrying(true)
     setRetryMsg(null)
     try {
-      const res  = await fetch('/api/betting/retry-orders', { method: 'POST' })
+      const res  = await fetch('/api/betting/retry-cycle', { method: 'POST' })
       const data = await res.json()
       setRetryMsg(res.ok
-        ? { ok: true,  text: data.message ?? 'Órdenes se reenviarán en ~30 s.' }
+        ? { ok: true,  text: data.message ?? 'Ciclo (+ órdenes) se relanzará en ~30 s.' }
         : { ok: false, text: data.error   ?? 'Error desconocido' }
       )
     } catch {
