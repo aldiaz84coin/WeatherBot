@@ -85,8 +85,8 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
 
   // ── 3. Ensemble con fuentes registradas ───────────────────────────────────
   const manager     = await setupManager(customWeights)
-  const ensembleRes = await manager.getEnsembleForecast(tomorrow)  // ✅ firma real
-  const rawEnsemble = ensembleRes.ensembleTemp                      // ✅ campo real
+  const ensembleRes = await manager.getEnsembleForecast(tomorrow)
+  const rawEnsemble = ensembleRes.ensembleTemp
 
   if (!rawEnsemble) {
     await logger.error(`No se pudo obtener ensemble para ${tomorrow}`)
@@ -102,12 +102,11 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   )
 
   // ── 5. Obtener precios de Polymarket ──────────────────────────────────────
-  // Firma real: buildPosition(ensembleTemp: number, targetDate: string)
-  const position = await buildPosition(adjustedEnsemble, tomorrow)  // ✅ orden real
+  const position = await buildPosition(adjustedEnsemble, tomorrow)
 
-  const tokenA = position.tokenA.tempCelsius   // ✅ nombre real
+  const tokenA = position.tokenA.tempCelsius
   const tokenB = position.tokenB.tempCelsius
-  const priceA = position.tokenA.priceAtBuy    // ✅ nombre real
+  const priceA = position.tokenA.priceAtBuy
   const priceB = position.tokenB.priceAtBuy
 
   // ── 6. Calcular stake y shares (Martingala) ───────────────────────────────
@@ -126,7 +125,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       ensemble_temp:     rawEnsemble,
       bias_applied:      biasN,
       ensemble_adjusted: adjustedEnsemble,
-      source_temps:      ensembleRes.sourceTemps,  // ✅ nombre real
+      source_temps:      ensembleRes.sourceTemps,
       ensemble_config:   ensembleRes.weights,
       opt_weights:       customWeights,
       token_a:           tokenA,
@@ -154,7 +153,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
     .insert([
       {
         prediction_id: prediction.id,
-        slug:          position.tokenA.slug,  // ✅ nombre real
+        slug:          position.tokenA.slug,
         token_temp:    tokenA,
         position:      'a',
         cost_usdc:     costA,
@@ -165,7 +164,7 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       },
       {
         prediction_id: prediction.id,
-        slug:          position.tokenB.slug,  // ✅ nombre real
+        slug:          position.tokenB.slug,
         token_temp:    tokenB,
         position:      'b',
         cost_usdc:     costB,
@@ -182,14 +181,23 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   }
 
   // ── 9. Crear betting_cycle ────────────────────────────────────────────────
+  // FIX: incluir token_a_temp, token_b_temp y todos los campos de precio/shares
+  // que el schema tiene y que retry-orders y settle-cycle necesitan leer.
   const { data: cycle, error: cycleError } = await supabase
     .from('betting_cycles')
     .insert({
       target_date:     tomorrow,
       prediction_id:   prediction.id,
-      base_stake_usdc: stake.baseStake,  // ← requerido NOT NULL
+      base_stake_usdc: stake.baseStake,
       stake_usdc:      totalStake,
       multiplier:      stake.multiplier,
+      token_a_temp:    tokenA,        // ← FIX: antes faltaba
+      token_b_temp:    tokenB,        // ← FIX: antes faltaba
+      price_a:         priceA,        // ← FIX: antes faltaba
+      price_b:         priceB,        // ← FIX: antes faltaba
+      shares:          shares,        // ← FIX: antes faltaba
+      cost_a_usdc:     costA,         // ← FIX: antes faltaba
+      cost_b_usdc:     costB,         // ← FIX: antes faltaba
       status:          'open',
       simulated:       isSimulated,
     })
@@ -263,6 +271,8 @@ async function logActiveConfig(
 }
 
 // ─── Crear ciclo desde predicción existente ───────────────────────────────────
+// FIX: ahora lee token_a/token_b de la predicción existente y los escribe
+// en betting_cycles para que retry-orders y settle-cycle puedan leerlos.
 
 async function createCycleFromExistingPrediction(
   predictionId: string,
@@ -272,14 +282,33 @@ async function createCycleFromExistingPrediction(
 ): Promise<void> {
   const totalStake = stake.baseStake * stake.multiplier
 
+  // Leer tokens y costes de la predicción ya guardada
+  const { data: pred } = await supabase
+    .from('predictions')
+    .select('token_a, token_b, cost_a_usdc, cost_b_usdc, stake_usdc')
+    .eq('id', predictionId)
+    .maybeSingle()
+
+  const tokenA  = pred?.token_a      ?? null
+  const tokenB  = pred?.token_b      ?? null
+  const costA   = pred?.cost_a_usdc  ?? null
+  const costB   = pred?.cost_b_usdc  ?? null
+  const shares  = (costA != null && costB != null && (costA + costB) > 0)
+    ? totalStake / (costA + costB) * (costA / totalStake * totalStake / (pred?.stake_usdc ?? totalStake) * totalStake)
+    : null
+
   const { error } = await supabase
     .from('betting_cycles')
     .insert({
       target_date:     tomorrow,
       prediction_id:   predictionId,
-      base_stake_usdc: stake.baseStake,  // ← requerido NOT NULL
+      base_stake_usdc: stake.baseStake,
       stake_usdc:      totalStake,
       multiplier:      stake.multiplier,
+      token_a_temp:    tokenA,   // ← FIX
+      token_b_temp:    tokenB,   // ← FIX
+      cost_a_usdc:     costA,    // ← FIX
+      cost_b_usdc:     costB,    // ← FIX
       status:          'open',
       simulated:       isSimulated,
     })
@@ -288,7 +317,8 @@ async function createCycleFromExistingPrediction(
     await logger.error(`Error creando cycle desde predicción existente: ${error.message}`, error)
   } else {
     await logger.log('success', 'prediction',
-      `✅ Ciclo creado desde predicción existente — ${tomorrow} | Stake: $${totalStake} (×${stake.multiplier})`
+      `✅ Ciclo creado desde predicción existente — ${tomorrow} | ` +
+      `Tokens: ${tokenA}°/${tokenB}° | Stake: $${totalStake} (×${stake.multiplier})`
     )
   }
 }
