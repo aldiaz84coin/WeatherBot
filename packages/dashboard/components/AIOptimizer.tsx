@@ -259,15 +259,16 @@ export function AIOptimizer() {
               <div className="flex items-center justify-between">
                 <h3 className="text-white font-medium text-sm">⚖️ Pesos recomendados por fuente</h3>
                 <div className="flex items-center gap-2">
-                  {w.improvedVsPrev !== 0 && (
-                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${
-                      w.improvedVsPrev > 0
-                        ? 'bg-green-950 text-green-400'
-                        : 'bg-red-950 text-red-400'
-                    }`}>
-                      {w.improvedVsPrev > 0 ? '↓' : '↑'} MAE {Math.abs(w.improvedVsPrev).toFixed(3)}°C
-                    </span>
-                  )}
+                  {w.improvedVsPrev != null && w.improvedVsPrev !== 0 && (() => {
+                    const imp = w.improvedVsPrev as number
+                    return (
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full ${
+                        imp > 0 ? 'bg-green-950 text-green-400' : 'bg-red-950 text-red-400'
+                      }`}>
+                        {imp > 0 ? '↓' : '↑'} MAE {Math.abs(imp).toFixed(3)}°C
+                      </span>
+                    )
+                  })()}
                   <button
                     onClick={applyWeights}
                     disabled={applying}
