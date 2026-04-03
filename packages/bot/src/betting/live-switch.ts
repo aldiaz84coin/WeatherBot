@@ -264,12 +264,13 @@ async function executeLiveSwitch(): Promise<void> {
   const { data: cycle, error: cycleError } = await supabase
     .from('betting_cycles')
     .insert({
-      target_date:   tomorrow,
-      prediction_id: prediction.id,
-      stake_usdc:    liveStake,
-      multiplier:    1,           // ← siempre 1× en el primer ciclo live
-      status:        'open',
-      simulated:     false,       // ← LIVE
+      target_date:     tomorrow,
+      prediction_id:   prediction.id,
+      base_stake_usdc: liveStake,  // ← 1× base (sin Martingala en el primer ciclo live)
+      stake_usdc:      liveStake,
+      multiplier:      1,          // ← siempre 1× en el primer ciclo live
+      status:          'open',
+      simulated:       false,      // ← LIVE
     })
     .select()
     .single()
