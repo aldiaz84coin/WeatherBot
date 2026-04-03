@@ -21,40 +21,51 @@ function getSupabase() {
 async function getWeightsAndBias() {
   const supabase = getSupabase()
 
-  const [{ data: sources }, { data: lastEvent }] = await Promise.all([
+  const [{ data: sources }, { data: biasConfig }] = await Promise.all([
     supabase
       .from('weather_sources')
       .select('slug, name, weight, updated_at')
       .eq('active', true)
       .order('weight', { ascending: false }),
     supabase
-      .from('bot_events')
-      .select('metadata, created_at')
-      .eq('category', 'weight_update')
-      .order('created_at', { ascending: false })
-      .limit(1)
+      .from('bot_config')
+      .select('value, updated_at')
+      .eq('key', 'prediction_bias_n')
       .maybeSingle(),
   ])
 
-  const meta  = lastEvent?.metadata as Record<string, unknown> | null
-  const biasN = (meta?.biasN as number | undefined) ?? null
+  const rawBias = biasConfig?.value
+  const biasN = rawBias !== null && rawBias !== undefined ? Number(rawBias) : null
 
   return {
     weights:   sources ?? [],
-    biasN,
-    updatedAt: lastEvent?.created_at ?? null,
+    biasN:     biasN !== null && !isNaN(biasN) ? biasN : null,
+    updatedAt: biasConfig?.updated_at ?? null,
   }
 }
 
+async function getBettingMode(): Promise<boolean> {
+  const supabase = getSupabase()
+  const { data } = await supabase
+    .from('bot_config')
+    .select('value')
+    .eq('key', 'betting_mode')
+    .maybeSingle()
+
+  // value es jsonb: puede llegar como string "live" o '"live"'
+  const raw = data?.value
+  const mode = typeof raw === 'string' ? raw.replace(/"/g, '') : String(raw ?? '')
+  return mode === 'live'
+}
+
 export default async function HomePage() {
-  const [perf, summaries, latestRun, { weights, biasN, updatedAt }] = await Promise.all([
+  const [perf, summaries, latestRun, { weights, biasN, updatedAt }, isLive] = await Promise.all([
     getPerformance(),
     getDailySummaries(60),
     getLatestTrainingRun(),
     getWeightsAndBias(),
+    getBettingMode(),
   ])
-
-  const isLive = process.env.NEXT_PUBLIC_LIVE_TRADING === 'true'
 
   return (
     <div className="space-y-6">
