@@ -2,7 +2,7 @@
 // Overview principal: estado del bot, KPIs, configuración activa y últimas predicciones
 
 import { createClient } from '@supabase/supabase-js'
-import { getPerformance, getDailySummaries } from '../lib/supabase'
+import { getPerformance, getDailySummaries, getLatestTrainingRun } from '../lib/supabase'
 import { BotStatus }       from '../components/BotStatus'
 import { PredictionCard }  from '../components/PredictionCard'
 import { PnlChart }        from '../components/PnlChart'
@@ -49,24 +49,13 @@ async function getWeightsAndBias() {
   }
 }
 
-async function getLatestTrainingRun() {
-  const supabase = getSupabase()
-  const { data } = await supabase
-    .from('training_runs')
-    .select('run_at, hit_rate, days_tested, passed, notes')
-    .order('run_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
-  return data
-}
-
 // ── Página ────────────────────────────────────────────────────────────────────
 
 export default async function HomePage() {
   const [perf, summaries, latestRun, { weights, biasN, updatedAt }] = await Promise.all([
     getPerformance(),
     getDailySummaries(60),
-    getLatestTrainingRun(),
+    getLatestTrainingRun(),   // tipo TrainingRun | null — compatible con BotStatus
     getWeightsAndBias(),
   ])
 
