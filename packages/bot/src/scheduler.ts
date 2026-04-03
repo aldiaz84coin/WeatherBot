@@ -27,7 +27,7 @@ import { runBettingCycle          } from './betting/engine'
 import { settleBettingCycle       } from './betting/settle-cycle'
 import { runDailyAnalysis         } from './betting/daily-analysis'
 import { checkAndExecuteLiveSwitch } from './betting/live-switch'
-import { checkAndRetryBettingCycle  } from './betting/retry-cycle'
+import { checkAndRetryOrders        } from './betting/retry-orders'
 import { botLogger                  } from './betting/logger'
 
 const TZ = 'Europe/Madrid'
@@ -141,8 +141,8 @@ cron.schedule('*/30 * * * * *', async () => {
     // Transición simulated → live solicitada desde el dashboard
     await checkAndExecuteLiveSwitch()
 
-    // Retry ciclo de apuesta solicitado desde el dashboard
-    await checkAndRetryBettingCycle()
+    // Retry órdenes Polymarket solicitado desde el dashboard
+    await checkAndRetryOrders()
   } catch (err) {
     await botLogger.error('Error en job runner (30 s)', err)
   }
