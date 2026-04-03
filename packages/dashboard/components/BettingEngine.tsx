@@ -163,10 +163,10 @@ export function BettingEngine() {
     setRetrying(true)
     setRetryMsg(null)
     try {
-      const res  = await fetch('/api/betting/retry-cycle', { method: 'POST' })
+      const res  = await fetch('/api/betting/retry-orders', { method: 'POST' })
       const data = await res.json()
       setRetryMsg(res.ok
-        ? { ok: true,  text: data.message ?? 'Retry solicitado. El bot ejecutará en ~30 s.' }
+        ? { ok: true,  text: data.message ?? 'Órdenes se reenviarán en ~30 s.' }
         : { ok: false, text: data.error   ?? 'Error desconocido' }
       )
     } catch {
@@ -226,6 +226,18 @@ export function BettingEngine() {
 
   return (
     <div className="space-y-4">
+
+      {/* ── Badge modo (dinámico desde bot_config) ── */}
+      {status?.betting_mode && (
+        <div className={`self-end inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-xs w-fit ml-auto ${
+          status.betting_mode === 'live'
+            ? 'bg-green-950 border-green-800 text-green-300'
+            : 'bg-yellow-950 border-yellow-800 text-yellow-300'
+        }`}>
+          <span>{status.betting_mode === 'live' ? '🔴' : '🧪'}</span>
+          <span className="font-medium">{status.betting_mode === 'live' ? 'Modo Real (live)' : 'Modo Simulado'}</span>
+        </div>
+      )}
 
       {/* ── KPIs globales ── */}
       {status && (
