@@ -11,7 +11,7 @@
 // │  09-20 /1h   │ 📸 Snapshot de precios (ventana de mercado)              │
 // │  21:30       │ 🔔 Settlement + Martingala + optimización pesos          │
 // │  23:00       │ 🔁 Retry settlement (si el mercado tardó en resolver)    │
-// │  cada 30s    │ ⚙️  Job runner (backtests + live-switch pendiente)       │
+// │  cada 30s    │ ⚙️  Job runner (backtests + live-switch + retry ciclo)   │
 // └──────────────┴──────────────────────────────────────────────────────────┘
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -23,11 +23,12 @@ import { runDailySettlement  } from './prediction/settle'
 import { runPriceSnapshot    } from './prediction/price-snapshot'
 import { startJobRunner      } from './jobs/job-runner'
 
-import { runBettingCycle          } from './betting/engine'
-import { settleBettingCycle       } from './betting/settle-cycle'
-import { runDailyAnalysis         } from './betting/daily-analysis'
-import { checkAndExecuteLiveSwitch } from './betting/live-switch'
+import { runBettingCycle            } from './betting/engine'
+import { settleBettingCycle         } from './betting/settle-cycle'
+import { runDailyAnalysis           } from './betting/daily-analysis'
+import { checkAndExecuteLiveSwitch  } from './betting/live-switch'
 import { checkAndRetryOrders        } from './betting/retry-orders'
+import { checkAndRetryBettingCycle  } from './betting/retry-cycle'   // ← AÑADIDO
 import { botLogger                  } from './betting/logger'
 
 const TZ = 'Europe/Madrid'
@@ -47,12 +48,14 @@ const TZ = 'Europe/Madrid'
     nodeVersion: process.version,
   })
 
-  // ── Verificar live-switch pendiente en startup ───────────────────────────
-  // Cubre el caso en que el bot se reinicia justo después de activar live
+  // ── Verificar flags pendientes en startup ────────────────────────────────
+  // Cubre el caso en que el bot se reinicia justo después de activar un flag
   try {
     await checkAndExecuteLiveSwitch()
+    await checkAndRetryBettingCycle()   // ← AÑADIDO
+    await checkAndRetryOrders()
   } catch (err) {
-    await botLogger.error('Error en live-switch check (startup)', err)
+    await botLogger.error('Error en checks de startup', err)
   }
 })()
 
@@ -131,7 +134,7 @@ cron.schedule('0 23 * * *', async () => {
 }, { timezone: TZ })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CRON 7 — cada 30 s · JOB RUNNER (backtests + live-switch)
+// CRON 7 — cada 30 s · JOB RUNNER (backtests + live-switch + retry ciclo/órdenes)
 // ─────────────────────────────────────────────────────────────────────────────
 cron.schedule('*/30 * * * * *', async () => {
   try {
@@ -141,7 +144,10 @@ cron.schedule('*/30 * * * * *', async () => {
     // Transición simulated → live solicitada desde el dashboard
     await checkAndExecuteLiveSwitch()
 
-    // Retry órdenes Polymarket solicitado desde el dashboard
+    // Relanzar ciclo completo (predicción + órdenes) solicitado desde el dashboard
+    await checkAndRetryBettingCycle()   // ← AÑADIDO
+
+    // Retry solo órdenes (ciclo ya existe) solicitado desde el dashboard
     await checkAndRetryOrders()
   } catch (err) {
     await botLogger.error('Error en job runner (30 s)', err)
