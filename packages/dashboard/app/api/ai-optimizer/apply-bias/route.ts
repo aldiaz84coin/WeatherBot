@@ -25,7 +25,6 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  // Cliente inicializado dentro del handler para evitar errores en build time
   const supabase = createClient(supabaseUrl, supabaseKey)
 
   try {
@@ -83,23 +82,28 @@ export async function POST(req: NextRequest) {
     if (error) throw error
 
     // ── 4. Registrar en bot_events para confirmación visual ───────────────────
+    // FIX: campos correctos según schema: severity / event_type / payload
     const sign     = (v: number) => (v >= 0 ? '+' : '') + v.toFixed(1)
     const deltaStr = sign(rounded - prevN)
 
-    await supabase
+    const { error: logErr } = await supabase
       .from('bot_events')
       .insert({
-        level:     'success',
-        category:  'weight_update',
-        message:   `[AI Optimizer] Bias actualizado: ${sign(prevN)}°C → ${sign(rounded)}°C (Δ ${deltaStr}°C). Efectivo en el próximo ciclo (00:30).`,
-        metadata:  {
+        severity:   'success',
+        event_type: 'weight_update',
+        message:    `[AI Optimizer] Bias actualizado: ${sign(prevN)}°C → ${sign(rounded)}°C (Δ ${deltaStr}°C). Efectivo en el próximo ciclo (00:30).`,
+        payload: {
           source:   'ai_optimizer',
           prevBias: prevN,
           newBias:  rounded,
           delta:    rounded - prevN,
         },
-        created_at: now,
       })
+
+    if (logErr) {
+      console.error('[apply-bias] Error registrando bot_event:', logErr.message)
+      // No es fatal — el bias ya está guardado
+    }
 
     return NextResponse.json({ ok: true, bias: rounded, prevBias: prevN })
 
