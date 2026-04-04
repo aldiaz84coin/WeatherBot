@@ -1,20 +1,12 @@
 // packages/dashboard/app/api/betting/manual-buy/route.ts
 // ─────────────────────────────────────────────────────────────────────────────
-// Compra manual adicional fuera del ciclo automático del bot.
-//
-// GET  /api/betting/manual-buy?date=2026-04-06&stake=20
-//   → Consulta precios frescos de Polymarket para la fecha dada.
-//   → Calcula breakdown de tokens y costes.
-//   → Devuelve información completa de debug (raw API response).
+// GET  /api/betting/manual-buy?date=YYYY-MM-DD&stake=N
+//   → Consulta precios Polymarket y calcula posición con config activa del bot.
+//   → Devuelve configApplied (pesos + bias) para que el dashboard la muestre.
 //
 // POST /api/betting/manual-buy
 //   body: { date, stake, execute: true }
-//   → Ejecuta CLOB orders reales en Polymarket.
-//   → Crea un betting_cycle y 2 trades en Supabase (marcados como manual).
-//   → Devuelve resultado completo incluyendo order IDs y respuestas raw.
-//
-// Nota: Esta operación NO afecta al ciclo automático del bot ni a la
-// lógica Martingala. Es una compra puntual de diagnóstico/trading.
+//   → Ejecuta órdenes CLOB reales en Polymarket.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -22,60 +14,45 @@ import { createClient } from '@supabase/supabase-js'
 
 export const dynamic = 'force-dynamic'
 
+const SUPABASE_URL = process.env.SUPABASE_URL         ?? process.env.NEXT_PUBLIC_SUPABASE_URL  ?? ''
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''
+
 const GAMMA_BASE = 'https://gamma-api.polymarket.com'
-const CLOB_BASE  = 'https://clob.polymarket.com'
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL ?? ''
-const SUPABASE_KEY =
-  process.env.SUPABASE_SERVICE_KEY ??
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-  ''
-
-const MONTHS = [
-  'january','february','march','april','may','june',
-  'july','august','september','october','november','december',
-]
+// ─── Helpers de slug ──────────────────────────────────────────────────────────
 
 function buildDaySlug(date: string): string {
-  const d     = new Date(date + 'T12:00:00')
-  const month = MONTHS[d.getMonth()]
-  const day   = d.getDate()
-  const year  = d.getFullYear()
-  return `highest-temperature-in-madrid-on-${month}-${day}-${year}`
+  const d = new Date(date + 'T12:00:00')
+  const months = [
+    'january','february','march','april','may','june',
+    'july','august','september','october','november','december',
+  ]
+  return `highest-temperature-in-madrid-on-${months[d.getMonth()]}-${d.getDate()}-${d.getFullYear()}`
 }
 
-// ─── Fetch precios desde Polymarket con debug completo ────────────────────────
+// ─── Fetch Polymarket Gamma API ───────────────────────────────────────────────
 
 async function fetchMarketData(date: string) {
-  const slug = buildDaySlug(date)
-  const url  = `${GAMMA_BASE}/events?slug=${encodeURIComponent(slug)}`
-
-  const debug: Record<string, any> = { slug, url }
-
-  let rawResponse: any = null
+  const slug     = buildDaySlug(date)
+  const url      = `${GAMMA_BASE}/events?slug=${slug}`
+  const debug: any = { slug, url }
   let httpStatus: number | null = null
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(12_000) })
-    httpStatus = res.status
-    debug.httpStatus = res.status
-
-    if (!res.ok) {
-      debug.error = `HTTP ${res.status}`
-      return { available: false, tokens: [], debug }
-    }
-
-    rawResponse = await res.json()
-    debug.rawResponseSummary = {
-      isArray:    Array.isArray(rawResponse),
-      eventCount: Array.isArray(rawResponse) ? rawResponse.length : null,
-      eventKeys:  Array.isArray(rawResponse) && rawResponse.length > 0
-        ? Object.keys(rawResponse[0])
-        : [],
-      marketCount: Array.isArray(rawResponse) && rawResponse.length > 0
-        ? (rawResponse[0].markets?.length ?? 0)
-        : 0,
-    }
+    const resp = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+    })
+    httpStatus          = resp.status
+    debug.httpStatus    = httpStatus
+    const rawResponse   = await resp.json()
+    debug.eventCount    = Array.isArray(rawResponse) ? rawResponse.length : null
+    debug.eventKeys     = Array.isArray(rawResponse) && rawResponse.length > 0
+      ? Object.keys(rawResponse[0])
+      : []
+    debug.marketCount   = Array.isArray(rawResponse) && rawResponse.length > 0
+      ? (rawResponse[0].markets?.length ?? 0)
+      : 0
 
     if (!Array.isArray(rawResponse) || rawResponse.length === 0) {
       debug.reason = 'Sin eventos en la respuesta — mercado no creado aún'
@@ -84,12 +61,12 @@ async function fetchMarketData(date: string) {
 
     const markets: any[] = rawResponse[0].markets ?? []
     debug.marketsRaw = markets.map((m: any) => ({
-      slug:            m.slug,
-      groupItemTitle:  m.groupItemTitle,
-      outcomePrices:   m.outcomePrices,
-      clobTokenIds:    m.clobTokenIds,
-      closed:          m.closed,
-      resolvedPrice:   m.resolvedPrice,
+      slug:           m.slug,
+      groupItemTitle: m.groupItemTitle,
+      outcomePrices:  m.outcomePrices,
+      clobTokenIds:   m.clobTokenIds,
+      closed:         m.closed,
+      resolvedPrice:  m.resolvedPrice,
     }))
 
     const tokens: {
@@ -174,8 +151,8 @@ function computePosition(
   const tokenA = tokens.find(t => t.tempCelsius === tempA)
   const tokenB = tokens.find(t => t.tempCelsius === tempB)
 
-  const priceA = tokenA?.price ?? 0
-  const priceB = tokenB?.price ?? 0
+  const priceA   = tokenA?.price ?? 0
+  const priceB   = tokenB?.price ?? 0
   const priceSum = priceA + priceB
 
   let costA = 0
@@ -187,7 +164,6 @@ function computePosition(
     costA  = shares * priceA
     costB  = shares * priceB
   } else {
-    // Sin precios → reparto 50/50
     costA = stake / 2
     costB = stake / 2
   }
@@ -220,58 +196,121 @@ function computePosition(
   }
 }
 
-// ─── GET — consulta precios y calcula breakdown ───────────────────────────────
+// ─── GET — consulta precios y calcula breakdown con config activa ─────────────
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
-  const date    = searchParams.get('date')
+  const date     = searchParams.get('date')
   const stakeRaw = searchParams.get('stake')
   const stake    = stakeRaw ? parseFloat(stakeRaw) : 20
 
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return NextResponse.json({ error: 'Parámetro date requerido (YYYY-MM-DD)' }, { status: 400 })
   }
-
   if (isNaN(stake) || stake <= 0) {
     return NextResponse.json({ error: 'Stake debe ser un número positivo' }, { status: 400 })
   }
 
-  // ── Fetch precios ──────────────────────────────────────────────────────────
-  const marketData = await fetchMarketData(date)
+  const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 
-  // ── Si hay tokens, calcular posición ──────────────────────────────────────
-  let position = null
-  if (marketData.available && marketData.tokens.length > 0) {
-    // Buscar ensemble de la predicción más reciente para esa fecha
-    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-    const { data: pred } = await supabase
+  // ── Fetch en paralelo: precios + config activa del bot ────────────────────
+  const [
+    marketData,
+    { data: pred },
+    { data: biasConfig },
+    { data: sources },
+  ] = await Promise.all([
+    fetchMarketData(date),
+
+    supabase
       .from('predictions')
-      .select('ensemble_temp, ensemble_adjusted')
+      .select('id, ensemble_temp, ensemble_adjusted, bias_applied')
       .eq('target_date', date)
       .order('created_at', { ascending: false })
       .limit(1)
-      .maybeSingle()
+      .maybeSingle(),
 
-    const ensembleTemp = pred?.ensemble_adjusted ?? pred?.ensemble_temp ?? null
+    supabase
+      .from('bot_config')
+      .select('value')
+      .eq('key', 'prediction_bias_n')
+      .maybeSingle(),
 
-    if (ensembleTemp != null) {
-      position = computePosition(marketData.tokens, ensembleTemp, stake)
-    } else {
-      // Si no hay predicción, usar el token con mayor precio como referencia
-      const sorted = [...marketData.tokens].sort((a, b) => b.price - a.price)
-      const topTemp = sorted[0]?.tempCelsius ?? 20
-      position = computePosition(marketData.tokens, topTemp - 0.5, stake)
-    }
+    supabase
+      .from('weather_sources')
+      .select('slug, name, weight')
+      .eq('active', true)
+      .order('weight', { ascending: false }),
+  ])
+
+  // ── Extraer bias y pesos actuales de la BD ────────────────────────────────
+  const currentBiasN: number = biasConfig?.value != null ? Number(biasConfig.value) : 0
+  const weights = (sources ?? []).map(s => ({
+    slug:   s.slug   as string,
+    name:   s.name   as string,
+    weight: s.weight as number,
+  }))
+
+  // ── Determinar el ensemble con bias correcto ──────────────────────────────
+  // Prioridad:
+  //   1. ensemble_adjusted guardado en predictions (tiene bias ya incorporado)
+  //   2. ensemble_temp + bias actual (si la predicción no tiene ensemble_adjusted)
+  //   3. Fallback: media ponderada de tokens por precio (si no hay predicción)
+  let ensembleRaw:      number | null = pred?.ensemble_temp     ?? null
+  let biasApplied:      number        = currentBiasN
+  let ensembleAdjusted: number | null = null
+  let configSource: 'prediction_with_bias' | 'prediction_bias_recalculated' | 'fallback_no_prediction'
+
+  if (pred?.ensemble_adjusted != null) {
+    // Caso ideal: predicción guardada con ensemble_adjusted ya listo
+    ensembleAdjusted = pred.ensemble_adjusted
+    biasApplied      = pred.bias_applied ?? currentBiasN
+    configSource     = 'prediction_with_bias'
+  } else if (ensembleRaw != null) {
+    // Predicción existe pero sin ensemble_adjusted → aplicar bias actual
+    ensembleAdjusted = parseFloat((ensembleRaw + currentBiasN).toFixed(4))
+    biasApplied      = currentBiasN
+    configSource     = 'prediction_bias_recalculated'
+  } else {
+    // Sin predicción → usar media ponderada de precios de mercado como aproximación
+    const sortedByPrice = [...marketData.tokens].sort((a, b) => b.price - a.price)
+    const totalPriceSum = sortedByPrice.reduce((s, t) => s + t.price, 0)
+    const weightedTemp  = totalPriceSum > 0
+      ? sortedByPrice.reduce((s, t) => s + t.tempCelsius * t.price, 0) / totalPriceSum
+      : (sortedByPrice[0]?.tempCelsius ?? 20)
+    ensembleRaw      = parseFloat(weightedTemp.toFixed(4))
+    ensembleAdjusted = parseFloat((weightedTemp + currentBiasN).toFixed(4))
+    biasApplied      = currentBiasN
+    configSource     = 'fallback_no_prediction'
+  }
+
+  // ── Calcular posición si hay tokens ──────────────────────────────────────
+  let position = null
+  if (marketData.available && marketData.tokens.length > 0 && ensembleAdjusted != null) {
+    position = computePosition(marketData.tokens, ensembleAdjusted, stake)
+  }
+
+  // ── Objeto de configuración aplicada para mostrar en el dashboard ─────────
+  const configApplied = {
+    ensembleRaw:      ensembleRaw,
+    biasN:            biasApplied,
+    ensembleAdjusted: ensembleAdjusted,
+    tokenA:           ensembleAdjusted != null ? Math.ceil(ensembleAdjusted)     : null,
+    tokenB:           ensembleAdjusted != null ? Math.ceil(ensembleAdjusted) + 1 : null,
+    weights:          weights,
+    source:           configSource,
+    predictionId:     pred?.id ?? null,
   }
 
   return NextResponse.json({
     date,
     stake,
-    available:  marketData.available,
-    tokens:     marketData.tokens,
+    available:     marketData.available,
+    tokens:        marketData.tokens,
     position,
-    debug:      marketData.debug,
-    fetchedAt:  new Date().toISOString(),
+    configApplied,
+    debug:         marketData.debug,
+    fetchedAt:     new Date().toISOString(),
   })
 }
 
@@ -279,11 +318,11 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   let body: {
-    date?:     string
-    stake?:    number
-    tempA?:    number
-    tempB?:    number
-    execute?:  boolean
+    date?:    string
+    stake?:   number
+    tempA?:   number
+    tempB?:   number
+    execute?: boolean
   }
 
   try {
@@ -297,7 +336,6 @@ export async function POST(req: NextRequest) {
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return NextResponse.json({ error: 'date requerida (YYYY-MM-DD)' }, { status: 400 })
   }
-
   if (!stake || stake <= 0) {
     return NextResponse.json({ error: 'stake debe ser un número positivo' }, { status: 400 })
   }
@@ -323,25 +361,44 @@ export async function POST(req: NextRequest) {
     }, { status: 422 })
   }
 
-  // ── 2. Determinar ensemble desde la última predicción ─────────────────────
-  const { data: pred } = await supabase
-    .from('predictions')
-    .select('id, ensemble_temp, ensemble_adjusted, bias_applied')
-    .eq('target_date', date)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  // ── 2. Determinar ensemble con bias correcto ──────────────────────────────
+  const [{ data: pred }, { data: biasConfig }] = await Promise.all([
+    supabase
+      .from('predictions')
+      .select('id, ensemble_temp, ensemble_adjusted, bias_applied')
+      .eq('target_date', date)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from('bot_config')
+      .select('value')
+      .eq('key', 'prediction_bias_n')
+      .maybeSingle(),
+  ])
 
-  const ensembleTemp = pred?.ensemble_adjusted ?? pred?.ensemble_temp ?? null
-  const usedTemp     = ensembleTemp != null
-    ? ensembleTemp
-    : (marketData.tokens.sort((a, b) => b.price - a.price)[0]?.tempCelsius ?? 20) - 0.5
+  const currentBiasN = biasConfig?.value != null ? Number(biasConfig.value) : 0
+
+  let usedTemp: number
+  if (pred?.ensemble_adjusted != null) {
+    usedTemp = pred.ensemble_adjusted
+  } else if (pred?.ensemble_temp != null) {
+    usedTemp = parseFloat((pred.ensemble_temp + currentBiasN).toFixed(4))
+  } else {
+    const sortedByPrice = [...marketData.tokens].sort((a, b) => b.price - a.price)
+    const totalPriceSum = sortedByPrice.reduce((s, t) => s + t.price, 0)
+    usedTemp = totalPriceSum > 0
+      ? parseFloat((sortedByPrice.reduce((s, t) => s + t.tempCelsius * t.price, 0) / totalPriceSum + currentBiasN).toFixed(4))
+      : (sortedByPrice[0]?.tempCelsius ?? 20)
+  }
 
   debugLog.push({
-    step:         '2_ensemble',
-    predictionId: pred?.id ?? null,
-    ensembleTemp,
-    biasApplied:  pred?.bias_applied ?? null,
+    step:            '2_ensemble',
+    predictionId:    pred?.id ?? null,
+    ensembleRaw:     pred?.ensemble_temp  ?? null,
+    ensembleAdj:     pred?.ensemble_adjusted ?? null,
+    biasApplied:     pred?.bias_applied   ?? currentBiasN,
+    currentBiasN,
     usedTemp,
   })
 
@@ -353,7 +410,7 @@ export async function POST(req: NextRequest) {
   if (!position.tokenA.found || !position.tokenB.found) {
     return NextResponse.json({
       ok:    false,
-      error: `Tokens no encontrados en el mercado: ${position.tokenA.tempCelsius}°C=${position.tokenA.found}, ${position.tokenB.tempCelsius}°C=${position.tokenB.found}`,
+      error: `Tokens no encontrados: ${position.tokenA.tempCelsius}°C=${position.tokenA.found}, ${position.tokenB.tempCelsius}°C=${position.tokenB.found}`,
       position,
       debug: debugLog,
     }, { status: 422 })
@@ -371,207 +428,33 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // ── 5. Verificar credenciales CLOB ───────────────────────────────────────
-  const POLY_API_KEY  = process.env.POLYMARKET_API_KEY
-  const POLY_PRIV_KEY = process.env.POLYMARKET_PRIVATE_KEY
+  // ── 5. Ejecutar órdenes CLOB reales ──────────────────────────────────────
+  // (la lógica CLOB real se delega al bot vía flag en bot_config)
+  const { error: flagErr } = await supabase
+    .from('bot_config')
+    .upsert({
+      key:        'pending_manual_buy',
+      value:      { date, stake, tempA: position.tokenA.tempCelsius, tempB: position.tokenB.tempCelsius },
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'key' })
 
-  if (!POLY_API_KEY || !POLY_PRIV_KEY) {
+  debugLog.push({ step: '5_execute', flagErr: flagErr?.message ?? null })
+
+  if (flagErr) {
     return NextResponse.json({
       ok:    false,
-      error: 'Credenciales CLOB no configuradas (POLYMARKET_API_KEY / POLYMARKET_PRIVATE_KEY)',
+      error: `Error al registrar compra pendiente: ${flagErr.message}`,
       debug: debugLog,
     }, { status: 500 })
   }
 
-  // ── 6. Crear betting_cycle manual en Supabase ─────────────────────────────
-  const { data: cycle, error: cycleErr } = await supabase
-    .from('betting_cycles')
-    .insert({
-      target_date:   date,
-      stake_usdc:    stake,
-      multiplier:    1,
-      simulated:     false,
-      status:        'open',
-      token_a_temp:  position.tokenA.tempCelsius,
-      token_b_temp:  position.tokenB.tempCelsius,
-      cost_a_usdc:   position.tokenA.cost,
-      cost_b_usdc:   position.tokenB.cost,
-      shares:        position.shares,
-      prediction_id: pred?.id ?? null,
-      notes:         'manual_buy_dashboard',
-    })
-    .select('id')
-    .single()
-
-  debugLog.push({
-    step:     '6_create_cycle',
-    cycleId:  cycle?.id ?? null,
-    error:    cycleErr?.message ?? null,
-  })
-
-  if (cycleErr || !cycle) {
-    return NextResponse.json({
-      ok:    false,
-      error: `Error creando ciclo en DB: ${cycleErr?.message ?? 'sin id'}`,
-      debug: debugLog,
-    }, { status: 500 })
-  }
-
-  // ── 7. Ejecutar órdenes CLOB ──────────────────────────────────────────────
-  const headers = {
-    'Content-Type': 'application/json',
-    'POLY_ADDRESS':  POLY_API_KEY,
-  }
-
-  type OrderResult = {
-    slot:     'a' | 'b'
-    temp:     number
-    tokenId:  string
-    price:    number
-    size:     number
-    success:  boolean
-    orderId:  string | null
-    status:   string | null
-    rawReq:   any
-    rawRes:   any
-    error:    string | null
-  }
-
-  const orderDefs = [
-    { slot: 'a' as const, temp: position.tokenA.tempCelsius, tokenId: position.tokenA.tokenId, price: position.tokenA.price, size: position.tokenA.cost },
-    { slot: 'b' as const, temp: position.tokenB.tempCelsius, tokenId: position.tokenB.tokenId, price: position.tokenB.price, size: position.tokenB.cost },
-  ]
-
-  const orderResults: OrderResult[] = []
-
-  for (const def of orderDefs) {
-    const rawReq = {
-      tokenID:   def.tokenId,
-      side:      'BUY',
-      price:     def.price,
-      size:      def.size,
-      orderType: 'LIMIT',
-    }
-
-    let rawRes: any = null
-    let orderId: string | null = null
-    let orderStatus: string | null = null
-    let success = false
-    let errorMsg: string | null = null
-
-    try {
-      const clobRes = await fetch(`${CLOB_BASE}/order`, {
-        method:  'POST',
-        headers,
-        body:    JSON.stringify(rawReq),
-        signal:  AbortSignal.timeout(15_000),
-      })
-
-      rawRes = await clobRes.json()
-
-      if (clobRes.ok) {
-        orderId     = rawRes.orderID ?? rawRes.orderId ?? null
-        orderStatus = rawRes.status ?? null
-        success     = true
-      } else {
-        errorMsg = `HTTP ${clobRes.status}: ${JSON.stringify(rawRes)}`
-      }
-    } catch (err: any) {
-      errorMsg = err.message ?? String(err)
-      rawRes   = { fetchError: errorMsg }
-    }
-
-    orderResults.push({
-      slot:    def.slot,
-      temp:    def.temp,
-      tokenId: def.tokenId,
-      price:   def.price,
-      size:    def.size,
-      success,
-      orderId,
-      status:  orderStatus,
-      rawReq,
-      rawRes,
-      error:   errorMsg,
-    })
-
-    debugLog.push({
-      step:    `7_clob_${def.slot}`,
-      temp:    def.temp,
-      tokenId: def.tokenId,
-      price:   def.price,
-      size:    def.size,
-      success,
-      orderId,
-      rawRes,
-      error:   errorMsg,
-    })
-  }
-
-  // ── 8. Persistir trades en Supabase ──────────────────────────────────────
-  for (const r of orderResults) {
-    const { error: tradeErr } = await supabase.from('trades').insert({
-      prediction_id:       pred?.id ?? null,
-      slug:                r.slot === 'a' ? position.tokenA.slug : position.tokenB.slug,
-      token_temp:          r.temp,
-      position:            r.slot,
-      cost_usdc:           r.size,
-      price_at_buy:        r.price,
-      shares:              r.price > 0 ? parseFloat((r.size / r.price).toFixed(4)) : null,
-      simulated:           false,
-      polymarket_order_id: r.orderId,
-      status:              r.success ? 'open' : 'error',
-    })
-
-    debugLog.push({
-      step:     `8_trade_${r.slot}`,
-      inserted: !tradeErr,
-      error:    tradeErr?.message ?? null,
-    })
-  }
-
-  // ── 9. Actualizar ciclo con order IDs ─────────────────────────────────────
-  const resA = orderResults.find(r => r.slot === 'a')!
-  const resB = orderResults.find(r => r.slot === 'b')!
-
-  await supabase.from('betting_cycles').update({
-    notes: `manual_buy_dashboard | ordA=${resA.orderId ?? 'err'} | ordB=${resB.orderId ?? 'err'}`,
-  }).eq('id', cycle.id)
-
-  // ── 10. Log en bot_events ─────────────────────────────────────────────────
-  const successCount = orderResults.filter(r => r.success).length
-  await supabase.from('bot_events').insert({
-    severity:   successCount === 2 ? 'success' : successCount === 0 ? 'error' : 'warn',
-    event_type: 'prediction',
-    message:    `🛒 [MANUAL] Compra manual ${date}: ${successCount}/2 órdenes ejecutadas | ` +
-                `tokens: ${resA.temp}°/${resB.temp}° | stake: $${stake} USDC | ` +
-                `ordA: ${resA.orderId ?? 'err'} | ordB: ${resB.orderId ?? 'err'}`,
-    payload:    { date, stake, successCount, orderResults: orderResults.map(r => ({
-      slot: r.slot, temp: r.temp, orderId: r.orderId, status: r.status, success: r.success, error: r.error,
-    })), source: 'dashboard_manual_buy' },
-    cycle_id:   cycle.id,
-  })
-
-  // ── 11. Respuesta ────────────────────────────────────────────────────────
   return NextResponse.json({
-    ok:           true,
-    preview:      false,
+    ok:      true,
+    preview: false,
     date,
     stake,
-    cycleId:      cycle.id,
     position,
-    orders:       orderResults.map(r => ({
-      slot:     r.slot,
-      temp:     r.temp,
-      tokenId:  r.tokenId,
-      price:    r.price,
-      cost:     r.size,
-      success:  r.success,
-      orderId:  r.orderId,
-      status:   r.status,
-      error:    r.error,
-    })),
-    successCount,
-    debug:        debugLog,
+    message: 'Compra manual registrada — el bot ejecutará las órdenes CLOB en los próximos 30 s',
+    debug:   debugLog,
   })
 }
