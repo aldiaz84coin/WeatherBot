@@ -303,7 +303,7 @@ export class ClobClient {
         { signal: AbortSignal.timeout(8_000) }
       )
       if (!res.ok) return false
-      const data = await res.json()
+      const data = await res.json() as any
       const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
       return !!markets[0]?.neg_risk
     } catch {
@@ -324,7 +324,7 @@ export class ClobClient {
         headers: l2Headers,
         signal:  AbortSignal.timeout(8_000),
       })
-      const data = await res.json()
+      const data = await res.json() as any
       const balance = parseFloat(data?.balance ?? '0')
       console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)}`)
       return balance
