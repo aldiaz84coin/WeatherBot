@@ -283,7 +283,8 @@ export class ClobClient {
   // ── deriveAndPersist ──────────────────────────────────────────────────────
 
   private async deriveAndPersist(): Promise<L2Credentials> {
-    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, this.ethersSigner)
+    const rawKey     = this.privateKey.startsWith('0x') ? this.privateKey.slice(2) : this.privateKey
+    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, rawKey as any)
 
     let rawCreds: { key: string; secret: string; passphrase: string }
     try {
