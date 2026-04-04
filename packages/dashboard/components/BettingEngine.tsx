@@ -6,6 +6,12 @@
 // Esto evita errores CORS en redes corporativas que bloquean *.supabase.co.
 // El Realtime WebSocket también se elimina (bloqueado por las mismas redes);
 // se usa polling cada 60 s como única fuente de refresco.
+//
+// FIX 1: "Stake actual" ahora muestra el stake EFECTIVO SIGUIENTE =
+//         min(base_stake * current_multiplier, max_stake)
+//         en vez de latest_stake (stake del último ciclo pasado).
+// FIX 2: El badge de modo usa status.betting_mode que ya viene sin comillas
+//         desde el API route (donde se normalizan las comillas JSONB).
 
 import { useEffect, useState, useCallback } from 'react'
 import { format, parseISO } from 'date-fns'
@@ -100,6 +106,13 @@ function multiplierBar(mult: number | null, max: number | null, base: number | n
   return { pct, color }
 }
 
+/** Stake efectivo que se usará en el PRÓXIMO ciclo. */
+function computeNextStake(status: BettingStatus): number | null {
+  if (status.base_stake == null || status.current_multiplier == null) return null
+  const raw = status.base_stake * status.current_multiplier
+  return parseFloat(Math.min(raw, status.max_stake ?? raw).toFixed(2))
+}
+
 function statusBadge(status: string) {
   const map: Record<string, string> = {
     open:      'bg-blue-950 text-blue-400 border-blue-900',
@@ -159,65 +172,65 @@ function TomorrowCyclePanel({ cycle, onRefresh }: {
   return (
     <div className={`rounded-xl border p-4 ${
       isLive
-        ? 'bg-green-950/20 border-green-900'
-        : 'bg-gray-900 border-gray-800'
+        ? 'bg-green-950/10 border-green-900/50'
+        : 'bg-yellow-950/10 border-yellow-900/30'
     }`}>
       <div className="flex items-center justify-between mb-3">
         <div>
-          <p className="text-xs text-gray-500 uppercase tracking-wider mb-0.5">Ciclo de mañana</p>
-          <p className="text-sm font-medium text-white">{cycle.target_date}</p>
+          <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+            Ciclo de mañana — {cycle.target_date}
+          </p>
+          <p className="text-xs text-gray-600 mt-0.5">
+            {isLive ? '🔴 Modo live — órdenes reales' : '🟡 Modo simulado'}
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <span className={`text-xs px-2 py-0.5 rounded border font-medium ${statusBadge(cycle.status)}`}>
-            {cycle.status}
-          </span>
-          <span className={`text-xs px-2 py-0.5 rounded border ${
-            isLive
-              ? 'bg-green-950 text-green-400 border-green-900'
-              : 'bg-yellow-950 text-yellow-600 border-yellow-900'
-          }`}>
-            {isLive ? '🔴 LIVE' : '🟡 SIM'}
-          </span>
-        </div>
+        <span className={`text-xs px-2 py-0.5 rounded border font-medium ${statusBadge(cycle.status)}`}>
+          {cycle.status}
+        </span>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
         <div>
-          <p className="text-xs text-gray-500">Stake</p>
-          <p className="text-sm font-semibold text-white">{cycle.stake_usdc} USDC</p>
-        </div>
-        <div>
-          <p className="text-xs text-gray-500">Tokens</p>
-          <p className="text-sm font-semibold text-white">
-            {cycle.token_a_temp != null ? `${cycle.token_a_temp}°C` : '—'}
-            {' / '}
-            {cycle.token_b_temp != null ? `${cycle.token_b_temp}°C` : '—'}
-          </p>
-        </div>
-        <div>
-          <p className="text-xs text-gray-500">Ensemble ajustado</p>
-          <p className="text-sm font-semibold text-white">
-            {cycle.ensemble_adjusted != null ? `${cycle.ensemble_adjusted.toFixed(2)}°C` : '—'}
-          </p>
-          {cycle.bias_applied != null && (
-            <p className="text-xs text-gray-500">
-              N: {cycle.bias_applied >= 0 ? '+' : ''}{cycle.bias_applied.toFixed(2)}°C
-            </p>
+          <p className="text-[10px] text-gray-500 uppercase">Stake</p>
+          <p className="font-semibold text-white">{cycle.stake_usdc} USDC</p>
+          {cycle.multiplier > 1 && (
+            <p className="text-[10px] text-yellow-500">×{cycle.multiplier} Martingala</p>
           )}
         </div>
         <div>
-          <p className="text-xs text-gray-500">Multiplicador</p>
-          <p className="text-sm font-semibold text-white">{cycle.multiplier}×</p>
+          <p className="text-[10px] text-gray-500 uppercase">Token A</p>
+          <p className="font-semibold text-white">{cycle.token_a_temp != null ? `${cycle.token_a_temp}°C` : '—'}</p>
+          {cycle.cost_a_usdc != null && (
+            <p className="text-[10px] text-gray-500">${cycle.cost_a_usdc.toFixed(2)}</p>
+          )}
+        </div>
+        <div>
+          <p className="text-[10px] text-gray-500 uppercase">Token B</p>
+          <p className="font-semibold text-white">{cycle.token_b_temp != null ? `${cycle.token_b_temp}°C` : '—'}</p>
+          {cycle.cost_b_usdc != null && (
+            <p className="text-[10px] text-gray-500">${cycle.cost_b_usdc.toFixed(2)}</p>
+          )}
+        </div>
+        <div>
+          <p className="text-[10px] text-gray-500 uppercase">Ensemble adj.</p>
+          <p className="font-semibold text-white">
+            {cycle.ensemble_adjusted != null ? `${cycle.ensemble_adjusted.toFixed(2)}°C` : '—'}
+          </p>
+          {cycle.bias_applied != null && (
+            <p className="text-[10px] text-gray-500">
+              bias {cycle.bias_applied >= 0 ? '+' : ''}{cycle.bias_applied.toFixed(2)}°C
+            </p>
+          )}
         </div>
       </div>
 
-      {/* Botón Lanzar compra */}
-      {isLive && cycle.status === 'open' && (
-        <div className="space-y-1">
+      {/* Botón compra manual si live y hay tokens */}
+      {isLive && cycle.token_a_temp != null && cycle.token_b_temp != null && cycle.status === 'open' && (
+        <div className="mt-3 space-y-2">
           <button
             onClick={handleLaunchOrder}
             disabled={buying}
-            className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold border transition-all ${
+            className={`w-full py-2 text-xs rounded-lg border font-medium transition-all ${
               buying
                 ? 'bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed'
                 : 'bg-green-900 border-green-700 text-green-200 hover:bg-green-800 hover:border-green-500 cursor-pointer'
@@ -357,6 +370,12 @@ export function BettingEngine() {
     status?.base_stake         ?? null,
   )
 
+  // Stake efectivo que se usará en el PRÓXIMO ciclo (no el del último ciclo)
+  const nextStake = status ? computeNextStake(status) : null
+
+  // Modo normalizado (el API route ya quita las comillas JSONB)
+  const isLive = status?.betting_mode === 'live'
+
   return (
     <div className="space-y-4">
 
@@ -369,11 +388,11 @@ export function BettingEngine() {
             </h2>
             <div className="flex items-center gap-2">
               <span className={`text-xs px-2 py-0.5 rounded border font-medium ${
-                status.betting_mode === 'live'
+                isLive
                   ? 'bg-green-950 text-green-400 border-green-900'
                   : 'bg-yellow-950 text-yellow-600 border-yellow-900'
               }`}>
-                {status.betting_mode === 'live' ? '🔴 LIVE' : '🟡 SIMULACIÓN'}
+                {isLive ? '🔴 LIVE' : '🟡 SIMULACIÓN'}
               </span>
             </div>
           </div>
@@ -398,10 +417,19 @@ export function BettingEngine() {
               </p>
             </div>
             <div>
-              <p className="text-xs text-gray-500">Stake actual</p>
-              <p className="text-2xl font-bold text-white mt-0.5">
-                {status.latest_stake != null ? `${status.latest_stake} USDC` : '—'}
+              {/* FIX: mostrar stake EFECTIVO SIGUIENTE (base × mult), no el último ciclo */}
+              <p className="text-xs text-gray-500">
+                Próximo stake
+                {status.current_multiplier != null && status.current_multiplier > 1 && (
+                  <span className="text-yellow-600 ml-1">×{status.current_multiplier}</span>
+                )}
               </p>
+              <p className="text-2xl font-bold text-white mt-0.5">
+                {nextStake != null ? `${nextStake} USDC` : '—'}
+              </p>
+              {status.base_stake != null && (
+                <p className="text-[10px] text-gray-600">base: {status.base_stake} USDC</p>
+              )}
             </div>
           </div>
 
@@ -412,7 +440,7 @@ export function BettingEngine() {
                 Martingala: {status.consecutive_losses ?? 0} pérdida(s) consecutiva(s)
               </p>
               <p className="text-xs text-gray-500 font-mono">
-                {status.latest_stake ?? '—'} / {status.max_stake ?? '—'} USDC
+                {nextStake ?? '—'} / {status.max_stake ?? '—'} USDC
               </p>
               <div className="w-full bg-gray-800 rounded-full h-1.5">
                 <div
@@ -429,37 +457,30 @@ export function BettingEngine() {
       {tomorrowCycle ? (
         <TomorrowCyclePanel cycle={tomorrowCycle} onRefresh={load} />
       ) : (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex items-center justify-between gap-4">
-          <div>
-            <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Ciclo de mañana</p>
-            <p className="text-gray-600 text-sm">Sin ciclo creado para {tomorrowStr}</p>
-          </div>
-          <div className="flex flex-col items-end gap-1 shrink-0">
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-gray-500">Sin ciclo programado para mañana ({tomorrowStr})</p>
             <button
               onClick={handleRetryCycle}
               disabled={retrying}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-                retrying
-                  ? 'bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed'
-                  : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-blue-600 hover:text-blue-400 cursor-pointer'
-              }`}
+              className="text-xs px-3 py-1.5 rounded-lg bg-blue-900 border border-blue-800
+                         text-blue-300 hover:bg-blue-800 transition-colors disabled:opacity-50"
             >
-              <span className={retrying ? 'animate-spin inline-block' : ''}>🔁</span>
-              {retrying ? 'Solicitando…' : 'Relanzar ciclo'}
+              {retrying ? '⏳ Relanzando…' : '🔄 Forzar ciclo'}
             </button>
-            {retryMsg && (
-              <p className={`text-[10px] ${retryMsg.ok ? 'text-green-400' : 'text-red-400'}`}>
-                {retryMsg.ok ? '✅' : '❌'} {retryMsg.text}
-              </p>
-            )}
           </div>
+          {retryMsg && (
+            <p className={`text-xs ${retryMsg.ok ? 'text-green-400' : 'text-red-400'}`}>
+              {retryMsg.ok ? '✅' : '❌'} {retryMsg.text}
+            </p>
+          )}
         </div>
       )}
 
       {/* ── Historial de ciclos ── */}
       {cycles.length > 0 && (
         <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-800">
+          <div className="px-5 py-3 border-b border-gray-800">
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
               Historial de ciclos
             </p>
@@ -467,25 +488,28 @@ export function BettingEngine() {
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
-                <tr className="border-b border-gray-800">
-                  <th className="px-4 py-2 text-left text-gray-500 font-medium">Fecha</th>
-                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Tokens</th>
-                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Real</th>
-                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Stake</th>
-                  <th className="px-4 py-2 text-right text-gray-500 font-medium">PnL</th>
-                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Estado</th>
+                <tr className="border-b border-gray-800 text-gray-500">
+                  <th className="px-4 py-2 text-left">Fecha</th>
+                  <th className="px-4 py-2 text-left">Modo</th>
+                  <th className="px-4 py-2 text-right">Tokens</th>
+                  <th className="px-4 py-2 text-right">T. real</th>
+                  <th className="px-4 py-2 text-right">Stake</th>
+                  <th className="px-4 py-2 text-right">PnL</th>
+                  <th className="px-4 py-2 text-right">Estado</th>
                 </tr>
               </thead>
               <tbody>
                 {cycles.map(c => (
-                  <tr key={c.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
-                    <td className="px-4 py-2 text-gray-400 font-mono">
-                      {c.target_date}
-                      {c.simulated && (
-                        <span className="ml-1 text-yellow-700 text-[10px]">sim</span>
-                      )}
+                  <tr key={c.id} className="border-b border-gray-800/50 hover:bg-gray-800/20">
+                    <td className="px-4 py-2 text-gray-300">
+                      {format(parseISO(c.target_date), 'dd MMM', { locale: es })}
                     </td>
-                    <td className="px-4 py-2 text-right text-gray-300 font-mono">
+                    <td className="px-4 py-2">
+                      <span className={`text-[10px] ${c.simulated ? 'text-yellow-600' : 'text-green-500'}`}>
+                        {c.simulated ? 'SIM' : 'LIVE'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 text-right text-gray-400 font-mono">
                       {c.token_a_temp != null ? `${c.token_a_temp}°C` : '—'}
                       {' / '}
                       {c.token_b_temp != null ? `${c.token_b_temp}°C` : '—'}
