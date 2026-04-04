@@ -76,6 +76,18 @@ export class ClobClient {
     }
   }
 
+  // ── ethersSigner ─────────────────────────────────────────────────────────
+  // El SDK comprueba typeof signer._signTypedData === "function".
+  // Ethers v6 usa signTypedData() (sin guión bajo) — adaptamos la interfaz.
+
+  private get ethersSigner() {
+    return {
+      _signTypedData: (domain: any, types: any, value: any) =>
+        this.wallet.signTypedData(domain, types, value),
+      getAddress: () => Promise.resolve(this.wallet.address),
+    }
+  }
+
   // ── getCredentials ────────────────────────────────────────────────────────
 
   private async getCredentials(): Promise<L2Credentials> {
@@ -114,15 +126,10 @@ export class ClobClient {
   private async buildPolyClient(): Promise<PolyClobClient> {
     const creds = await this.getCredentials()
 
-    // Sin prefijo 0x — igual que Python
-    const rawKey = this.privateKey.startsWith('0x')
-      ? this.privateKey.slice(2)
-      : this.privateKey
-
     return new PolyClobClient(
       CLOB_HOST,
       Chain.POLYGON,
-      rawKey as any,            // private key string directamente (como Python key=private_key)
+      this.ethersSigner,        // objeto con _signTypedData — requerido por el SDK
       {
         key:        creds.apiKey,
         secret:     creds.apiSecret,
@@ -283,8 +290,7 @@ export class ClobClient {
   // ── deriveAndPersist ──────────────────────────────────────────────────────
 
   private async deriveAndPersist(): Promise<L2Credentials> {
-    const rawKey     = this.privateKey.startsWith('0x') ? this.privateKey.slice(2) : this.privateKey
-    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, rawKey as any)
+    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, this.ethersSigner as any)
 
     let rawCreds: { key: string; secret: string; passphrase: string }
     try {
