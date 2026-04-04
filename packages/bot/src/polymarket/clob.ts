@@ -2,32 +2,77 @@
 // Polymarket CLOB API — ejecución de órdenes reales
 // ⚠️  Solo se usa cuando LIVE_TRADING=true
 //
-// Usa el SDK oficial @polymarket/clob-client para firmar órdenes,
-// eliminando la necesidad de implementar EIP-712 / HMAC manualmente.
+// ────────────────────────────────────────────────────────────────────────────
+// IMPLEMENTACIÓN NATIVA — sin SDK JS (@polymarket/clob-client)
 //
-// Credenciales L2 (apiKey, secret, passphrase):
-//   Prioridad: ENV vars (CLOB_API_KEY/SECRET/PASSPHRASE) → Supabase → derivación
+// El SDK JS tiene incompatibilidades de firma EIP-712 con ethers v6 que
+// producen "invalid signature" incluso con el workaround del EIP712Domain.
+//
+// Esta implementación replica exactamente lo que hace el SDK Python
+// (py_clob_client) que SÍ funciona:
+//   1. Construye el struct de la orden (mismos campos que OrderArgs de Python)
+//   2. Firma con EIP-712 usando ethers v6 directamente (sin SDK)
+//   3. POST a /order con HMAC-SHA256 en los headers L2
+//
+// El dominio EIP-712 y el struct "Order" son idénticos a los del SDK Python.
+// ────────────────────────────────────────────────────────────────────────────
 
-import { ClobClient as PolyClobClient, Side, OrderType, Chain, AssetType } from '@polymarket/clob-client'
 import { ethers } from 'ethers'
+import { createHmac } from 'crypto'
 import { supabase } from '../db/supabase'
 
 const CLOB_HOST          = 'https://clob.polymarket.com'
+const CHAIN_ID           = 137                    // Polygon
 const SUPABASE_CREDS_KEY = 'clob_l2_credentials'
+
+// ─── EIP-712 ──────────────────────────────────────────────────────────────────
+// Dominio y tipos idénticos a los del contrato CTF Exchange de Polymarket
+// Fuente: https://github.com/Polymarket/py-clob-client/blob/main/py_clob_client/signing/model.py
+
+const EIP712_DOMAIN = {
+  name:              'ClobAuthDomain',
+  version:           '1',
+  chainId:           CHAIN_ID,
+}
+
+// Tipos para la orden — idénticos a OrderData en py-clob-client
+const ORDER_TYPES = {
+  Order: [
+    { name: 'salt',        type: 'uint256' },
+    { name: 'maker',       type: 'address' },
+    { name: 'signer',      type: 'address' },
+    { name: 'taker',       type: 'address' },
+    { name: 'tokenId',     type: 'uint256' },
+    { name: 'makerAmount', type: 'uint256' },
+    { name: 'takerAmount', type: 'uint256' },
+    { name: 'expiration',  type: 'uint256' },
+    { name: 'nonce',       type: 'uint256' },
+    { name: 'feeRateBps',  type: 'uint256' },
+    { name: 'side',        type: 'uint8'   },
+    { name: 'signatureType', type: 'uint8' },
+  ],
+}
+
+// ─── Contratos Polymarket (Polygon mainnet) ───────────────────────────────────
+// Fuente: py-clob-client contracts.py
+const COLLATERAL_TOKEN  = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174' // USDC.e
+const CTF_EXCHANGE      = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E' // neg_risk=false
+const NEG_RISK_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a' // neg_risk=true
+const NEG_RISK_ADAPTER  = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
 export interface OrderParams {
-  tokenId:  string   // clobTokenIds del mercado Polymarket
+  tokenId:  string
   side:     'BUY'
   price:    number   // 0.0 – 1.0
-  size:     number   // importe en USDC
-  negRisk?: boolean  // true para mercados Neg Risk (la mayoría de los nuevos)
+  size:     number   // importe en USDC (igual que Python: stake_usdc)
+  negRisk?: boolean
 }
 
 export interface OrderResult {
   orderId:    string
-  status:     'matched' | 'open' | 'cancelled'
+  status:     string
   filledSize: number
   price:      number
 }
@@ -40,6 +85,39 @@ interface L2Credentials {
   derivedAt:     string
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Precio en USDC (6 decimales) → uint256 en unidades micro */
+function toMicroUsdc(amount: number): bigint {
+  return BigInt(Math.round(amount * 1_000_000))
+}
+
+/** Convierte shares a uint256 (6 decimales, mismo que USDC para tokens Polymarket) */
+function toShares(amount: number): bigint {
+  return BigInt(Math.round(amount * 1_000_000))
+}
+
+/** HMAC-SHA256 para headers L2 — igual que py-clob-client */
+function buildL2Headers(
+  creds:     L2Credentials,
+  method:    string,
+  path:      string,
+  body:      string,
+  timestamp: number,
+): Record<string, string> {
+  const message  = `${timestamp}${method}${path}${body}`
+  const hmac     = createHmac('sha256', Buffer.from(creds.apiSecret, 'base64'))
+  hmac.update(message)
+  const signature = hmac.digest('base64')
+
+  return {
+    'POLY-API-KEY':     creds.apiKey,
+    'POLY-PASSPHRASE':  creds.apiPassphrase,
+    'POLY-TIMESTAMP':   String(timestamp),
+    'POLY-SIGNATURE':   signature,
+  }
+}
+
 // ─── ClobClient ───────────────────────────────────────────────────────────────
 
 export class ClobClient {
@@ -48,7 +126,7 @@ export class ClobClient {
 
   constructor(
     private walletAddress: string,
-    private privateKey:    string
+    private privateKey:    string,
   ) {
     const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`
     this.wallet = new ethers.Wallet(normalizedKey)
@@ -61,61 +139,224 @@ export class ClobClient {
       console.log('[CLOB] ✅ Addresses coinciden')
     }
 
+    // Pre-cargar credenciales L2 desde env si están disponibles
     const envKey        = process.env.CLOB_API_KEY
     const envSecret     = process.env.CLOB_API_SECRET
     const envPassphrase = process.env.CLOB_API_PASSPHRASE
     if (envKey && envSecret && envPassphrase) {
       console.log('[CLOB] 🔑 Credenciales L2 desde ENV vars:')
-      console.log(`[CLOB]   CLOB_API_KEY        = ${envKey.substring(0, 8)}…`)
-      console.log(`[CLOB]   CLOB_API_SECRET      = ${envSecret.substring(0, 8)}…`)
-      console.log(`[CLOB]   CLOB_API_PASSPHRASE  = ${envPassphrase.substring(0, 8)}…`)
+      console.log(`[CLOB]   CLOB_API_KEY       = ${envKey.substring(0, 8)}…`)
+      console.log(`[CLOB]   CLOB_API_SECRET     = ${envSecret.substring(0, 8)}…`)
+      console.log(`[CLOB]   CLOB_API_PASSPHRASE = ${envPassphrase.substring(0, 8)}…`)
       this.memCache = {
-        apiKey: envKey, apiSecret: envSecret, apiPassphrase: envPassphrase,
-        walletAddress: this.wallet.address, derivedAt: 'env-var',
+        apiKey:        envKey,
+        apiSecret:     envSecret,
+        apiPassphrase: envPassphrase,
+        walletAddress: this.wallet.address,
+        derivedAt:     'env-var',
       }
     }
   }
 
-  // ── ethersSigner ─────────────────────────────────────────────────────────
+  // ── placeOrder ────────────────────────────────────────────────────────────
   //
-  // FIX ethers v6 / clob-client (ethers v5) incompatibilidad:
-  //
-  // El SDK llama a _signTypedData(domain, types, value) donde `types` INCLUYE
-  // la entrada "EIP712Domain" (comportamiento de ethers v5).
-  // Ethers v6's signTypedData() rechaza esa entrada y produce una firma diferente
-  // → el servidor devuelve "invalid signature".
-  //
-  // Solución: eliminar EIP712Domain del objeto types antes de llamar a ethers v6.
+  // Replica exactamente client.create_and_post_order(OrderArgs(...)) de Python:
+  //   1. Calcula makerAmount / takerAmount según side
+  //   2. Firma con EIP-712 (signTypedData de ethers v6, SIN SDK JS)
+  //   3. POST /order con headers HMAC L2
 
-  private get ethersSigner() {
+  async placeOrder(params: OrderParams): Promise<OrderResult> {
+    if (process.env.LIVE_TRADING !== 'true') {
+      throw new Error('ClobClient: LIVE_TRADING is not enabled — aborting real order')
+    }
+
+    const creds   = await this.getCredentials()
+    const negRisk = params.negRisk ?? await this.getNegRisk(params.tokenId)
+
+    // ── 1. Calcular amounts ───────────────────────────────────────────────
+    // BUY: makerAmount = USDC a gastar, takerAmount = shares a recibir
+    // Python: size = stake / price  (en units de token)
+    const sharesFloat  = params.size / params.price    // shares = usdc / price
+    const makerAmount  = toMicroUsdc(params.size)      // USDC que pones
+    const takerAmount  = toShares(sharesFloat)         // tokens que recibes
+
+    console.log(
+      `[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | ` +
+      `shares=${sharesFloat.toFixed(4)} | negRisk=${negRisk}`
+    )
+    console.log(`[CLOB] makerAmount=${makerAmount} | takerAmount=${takerAmount}`)
+
+    // ── 2. Construir struct de la orden ───────────────────────────────────
+    // Igual que OrderData en py-clob-client/signing/model.py
+    const salt        = BigInt(Math.floor(Math.random() * 1_000_000_000_000))
+    const expiration  = BigInt(0)    // GTC (no expira)
+    const nonce       = BigInt(0)
+    const feeRateBps  = BigInt(0)
+    const sideValue   = BigInt(0)    // 0 = BUY
+    const sigType     = BigInt(1)    // 1 = POLY_PROXY (signature_type en Python)
+
+    const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
+    const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
+
+    const orderStruct = {
+      salt:          salt,
+      maker:         this.wallet.address,
+      signer:        this.wallet.address,
+      taker:         taker,
+      tokenId:       BigInt(params.tokenId),
+      makerAmount:   makerAmount,
+      takerAmount:   takerAmount,
+      expiration:    expiration,
+      nonce:         nonce,
+      feeRateBps:    feeRateBps,
+      side:          sideValue,
+      signatureType: sigType,
+    }
+
+    // ── 3. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
+    const domain = {
+      ...EIP712_DOMAIN,
+      verifyingContract: exchange,
+    }
+
+    let signature: string
+    try {
+      signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderStruct)
+      console.log('[CLOB] Orden firmada correctamente')
+    } catch (err) {
+      console.error('[CLOB] Error firmando orden:', err)
+      throw err
+    }
+
+    // ── 4. Construir payload JSON para POST /order ────────────────────────
+    // Formato esperado por el CLOB REST API (igual que py-clob-client)
+    const orderPayload = {
+      salt:          salt.toString(),
+      maker:         this.wallet.address,
+      signer:        this.wallet.address,
+      taker:         taker,
+      tokenId:       params.tokenId,
+      makerAmount:   makerAmount.toString(),
+      takerAmount:   takerAmount.toString(),
+      expiration:    expiration.toString(),
+      nonce:         nonce.toString(),
+      feeRateBps:    feeRateBps.toString(),
+      side:          'BUY',
+      signatureType: 1,
+      signature,
+    }
+
+    const body      = JSON.stringify({ order: orderPayload, orderType: 'GTC', negRisk })
+    const path      = '/order'
+    const timestamp = Math.floor(Date.now() / 1000)
+
+    const l2Headers = buildL2Headers(creds, 'POST', path, body, timestamp)
+
+    // ── 5. Enviar al CLOB REST API ────────────────────────────────────────
+    console.log('[CLOB] Enviando orden al CLOB REST API…')
+    let res: Response
+    try {
+      res = await fetch(`${CLOB_HOST}${path}`, {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...l2Headers,
+        },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      })
+    } catch (err) {
+      console.error('[CLOB] Error de red al enviar orden:', err)
+      throw err
+    }
+
+    const text = await res.text()
+    console.log(`[CLOB] Respuesta HTTP ${res.status}: ${text}`)
+
+    let data: any
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw new Error(`[CLOB] Respuesta no-JSON del servidor (HTTP ${res.status}): ${text}`)
+    }
+
+    if (data?.error || !res.ok) {
+      throw new Error(`[CLOB] Rechazada por el servidor: ${data?.error ?? text}`)
+    }
+
+    const orderId = data?.orderID ?? data?.id ?? data?.hash ?? 'unknown'
     return {
-      _signTypedData: (domain: any, types: any, value: any) => {
-        // Ethers v6 no acepta EIP712Domain dentro del mapa de tipos.
-        // El SDK (compilado para v5) siempre lo inyecta → lo filtramos aquí.
-        const { EIP712Domain: _removed, ...filteredTypes } = types
-        return this.wallet.signTypedData(domain, filteredTypes, value)
-      },
-      getAddress: () => Promise.resolve(this.wallet.address),
+      orderId,
+      status:     data?.status     ?? 'open',
+      filledSize: parseFloat(data?.sizeFilled ?? data?.size_filled ?? '0'),
+      price:      params.price,
+    }
+  }
+
+  // ── getNegRisk ────────────────────────────────────────────────────────────
+  // Consulta si el token es negRisk via REST (igual que Python)
+
+  async getNegRisk(tokenId: string): Promise<boolean> {
+    try {
+      const res = await fetch(
+        `${CLOB_HOST}/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
+        { signal: AbortSignal.timeout(8_000) }
+      )
+      if (!res.ok) return false
+      const data = await res.json()
+      const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
+      return !!markets[0]?.neg_risk
+    } catch {
+      return false
+    }
+  }
+
+  // ── getBalance ────────────────────────────────────────────────────────────
+
+  async getBalance(): Promise<number> {
+    const creds     = await this.getCredentials()
+    const path      = '/balance-allowance?asset_type=0'
+    const timestamp = Math.floor(Date.now() / 1000)
+    const l2Headers = buildL2Headers(creds, 'GET', path, '', timestamp)
+
+    try {
+      const res  = await fetch(`${CLOB_HOST}${path}`, {
+        headers: l2Headers,
+        signal:  AbortSignal.timeout(8_000),
+      })
+      const data = await res.json()
+      const balance = parseFloat(data?.balance ?? '0')
+      console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)}`)
+      return balance
+    } catch (err) {
+      console.warn('[CLOB] No se pudo consultar balance:', err)
+      return 0
     }
   }
 
   // ── getCredentials ────────────────────────────────────────────────────────
 
   private async getCredentials(): Promise<L2Credentials> {
+    // 1. ENV vars (máxima prioridad)
     const envKey        = process.env.CLOB_API_KEY
     const envSecret     = process.env.CLOB_API_SECRET
     const envPassphrase = process.env.CLOB_API_PASSPHRASE
     if (envKey && envSecret && envPassphrase) {
       return {
-        apiKey: envKey, apiSecret: envSecret, apiPassphrase: envPassphrase,
-        walletAddress: this.wallet.address, derivedAt: 'env-var',
+        apiKey:        envKey,
+        apiSecret:     envSecret,
+        apiPassphrase: envPassphrase,
+        walletAddress: this.wallet.address,
+        derivedAt:     'env-var',
       }
     }
 
+    // 2. Caché en memoria
     if (this.memCache && this.memCache.walletAddress === this.wallet.address) {
       return this.memCache
     }
 
+    // 3. Supabase
     const fromDb = await this.loadFromSupabase()
     if (fromDb) {
       console.log(`[CLOB] Credenciales L2 desde Supabase (apiKey: ${fromDb.apiKey.substring(0, 8)}…)`)
@@ -123,154 +364,82 @@ export class ClobClient {
       return fromDb
     }
 
+    // 4. Derivar
     console.log('[CLOB] Sin credenciales L2 — derivando desde private key…')
-    const derived = await this.deriveAndPersist()
+    const derived = await this.deriveCredentials()
     this.memCache = derived
     return derived
   }
 
-  // ── buildPolyClient ───────────────────────────────────────────────────────
-  //
-  // signatureType=1 (POLY_PROXY): los fondos viven en el proxy wallet de Polymarket,
-  // no en el EOA directamente. El CLOB verifica el balance en el proxy.
-  // Coincide con el script Python: signature_type=1, funder=EOA_address.
-  //
-  // El fix del EIP712Domain en ethersSigner resuelve la incompatibilidad
-  // ethers v6 / clob-client (v5), por lo que signatureType=1 ahora firma correctamente.
+  // ── deriveCredentials ─────────────────────────────────────────────────────
+  // Deriva credenciales L2 via POST /auth/api-key con firma EIP-712
+  // Igual que ClobClient.create_or_derive_api_key() en Python
 
-  private async buildPolyClient(): Promise<PolyClobClient> {
-    const creds = await this.getCredentials()
+  private async deriveCredentials(): Promise<L2Credentials> {
+    const timestamp = Math.floor(Date.now() / 1000)
+    const message   = `${timestamp}GET/auth/api-key`
 
-    console.log(`[CLOB] Funder: ${this.wallet.address} | signatureType: 1 (POLY_PROXY)`)
+    const domain = {
+      name:    'ClobAuthDomain',
+      version: '1',
+      chainId: CHAIN_ID,
+    }
+    const authTypes = {
+      ClobAuth: [
+        { name: 'address',   type: 'address' },
+        { name: 'timestamp', type: 'string'  },
+        { name: 'nonce',     type: 'uint256' },
+        { name: 'message',   type: 'string'  },
+      ],
+    }
+    const authValue = {
+      address:   this.wallet.address,
+      timestamp: String(timestamp),
+      nonce:     0,
+      message:   'This message attests that I have read and agree to the terms of service.',
+    }
 
-    return new PolyClobClient(
-      CLOB_HOST,
-      Chain.POLYGON,
-      this.ethersSigner,
-      {
-        key:        creds.apiKey,
-        secret:     creds.apiSecret,
-        passphrase: creds.apiPassphrase,
+    const sig = await this.wallet.signTypedData(domain, authTypes, authValue)
+
+    const res  = await fetch(`${CLOB_HOST}/auth/api-key`, {
+      method:  'GET',
+      headers: {
+        'POLY-ADDRESS':   this.wallet.address,
+        'POLY-SIGNATURE': sig,
+        'POLY-TIMESTAMP': String(timestamp),
+        'POLY-NONCE':     '0',
       },
-      1 as any,              // POLY_PROXY — fondos en el proxy wallet de Polymarket
-      this.wallet.address,   // funder = EOA (igual que Python)
-    )
+      signal: AbortSignal.timeout(10_000),
+    })
+
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`[CLOB] Error derivando credenciales (HTTP ${res.status}): ${text}`)
+    }
+
+    const data: any = await res.json()
+    const creds: L2Credentials = {
+      apiKey:        data.apiKey        ?? data.key,
+      apiSecret:     data.secret,
+      apiPassphrase: data.passphrase,
+      walletAddress: this.wallet.address,
+      derivedAt:     new Date().toISOString(),
+    }
+
+    console.log(`[CLOB] ✅ Credenciales derivadas — apiKey: ${creds.apiKey.substring(0, 8)}…`)
+    await this.saveToSupabase(creds)
+    return creds
   }
 
-  // ── placeOrder ────────────────────────────────────────────────────────────
-
-  async placeOrder(params: OrderParams): Promise<OrderResult> {
-    if (process.env.LIVE_TRADING !== 'true') {
-      throw new Error('ClobClient: LIVE_TRADING is not enabled — aborting real order')
-    }
-
-    // El SDK trabaja en shares (tokens), no en USDC
-    const sizeInShares = params.size / params.price
-
-    console.log(
-      `[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | ` +
-      `shares=${sizeInShares.toFixed(4)} | negRisk=${params.negRisk ?? 'auto'}`
-    )
-
-    const client = await this.buildPolyClient()
-
-    // ── Diagnóstico de balance (solo log, no bloquea la orden) ──────────────
-    // getBalanceAllowance refleja la allowance on-chain del CTF Exchange,
-    // que puede devolver 0 aunque haya USDC disponible para operar.
-    // Si realmente no hay fondos, el CLOB rechazará la orden con su propio error.
-    try {
-      const balRes    = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
-      const balance   = parseFloat((balRes as any)?.balance   ?? '0')
-      const allowance = parseFloat((balRes as any)?.allowance ?? '0')
-      console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)} | Allowance: ${allowance.toFixed(4)} | Necesario: ${params.size.toFixed(4)}`)
-    } catch (err: any) {
-      console.warn('[CLOB] No se pudo consultar balance:', err?.message)
-    }
-
-    // ── negRisk ───────────────────────────────────────────────────────────
-    let negRisk = params.negRisk
-    if (negRisk === undefined) {
-      try {
-        negRisk = await client.getNegRisk(params.tokenId)
-        console.log(`[CLOB] negRisk detectado: ${negRisk}`)
-      } catch {
-        negRisk = false
-        console.warn('[CLOB] No se pudo detectar negRisk, usando false')
-      }
-    }
-
-    try {
-      const signedOrder = await client.createOrder(
-        { tokenID: params.tokenId, price: params.price, size: sizeInShares, side: Side.BUY },
-        { negRisk }
-      )
-
-      console.log('[CLOB] Orden firmada, enviando…')
-      const res = await client.postOrder(signedOrder, OrderType.GTC)
-      console.log('[CLOB] Respuesta:', JSON.stringify(res))
-
-      // El SDK no lanza error en respuestas 4xx — detectarlas manualmente
-      if (res?.error || (typeof res?.status === 'number' && res.status >= 400)) {
-        throw new Error(`[CLOB] Rechazada por el servidor: ${res?.error ?? JSON.stringify(res)}`)
-      }
-
-      const orderId = res?.orderID ?? res?.orderId ?? res?.hash ?? 'unknown'
-      return {
-        orderId,
-        status:     res?.status     ?? 'open',
-        filledSize: res?.filledSize ?? 0,
-        price:      params.price,
-      }
-    } catch (err: any) {
-      const status = err?.response?.status
-      const body   = err?.response?.data
-      console.error(`[CLOB] Error placeOrder (HTTP ${status ?? '?'}):`, JSON.stringify(body ?? err?.message))
-      throw err
-    }
-  }
-
-  // ── getBalance ────────────────────────────────────────────────────────────
-
-  async getBalance(): Promise<number> {
-    const client = await this.buildPolyClient()
-    const res    = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
-    const balance = parseFloat((res as any)?.balance ?? '0')
-    console.log(`[CLOB] getBalance(): ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(res)})`)
-    return balance
-  }
-
-  // ── getOrder ──────────────────────────────────────────────────────────────
-
-  async getOrder(orderId: string): Promise<OrderResult> {
-    const client = await this.buildPolyClient()
-    const res    = await client.getOrder(orderId)
-    return {
-      orderId:    (res as any).id,
-      status:     (res as any).status as OrderResult['status'],
-      filledSize: (res as any).size_matched ? parseFloat((res as any).size_matched) : 0,
-      price:      (res as any).price ? parseFloat((res as any).price) : 0,
-    }
-  }
-
-  // ── clearSupabaseCredentials ──────────────────────────────────────────────
-
-  async clearSupabaseCredentials(): Promise<void> {
-    this.memCache = null
-    try {
-      await supabase.from('bot_config').delete().eq('key', SUPABASE_CREDS_KEY)
-      console.log('[CLOB] Credenciales L2 eliminadas de Supabase.')
-    } catch (err) {
-      console.error('[CLOB] Error eliminando credenciales:', (err as Error).message)
-    }
-  }
-
-  // ── loadFromSupabase ──────────────────────────────────────────────────────
+  // ── Supabase helpers ──────────────────────────────────────────────────────
 
   private async loadFromSupabase(): Promise<L2Credentials | null> {
     try {
       const { data, error } = await supabase
-        .from('bot_config').select('value').eq('key', SUPABASE_CREDS_KEY).maybeSingle()
-
+        .from('bot_config')
+        .select('value')
+        .eq('key', SUPABASE_CREDS_KEY)
+        .maybeSingle()
       if (error || !data) return null
       const creds = data.value as L2Credentials
       if (
@@ -287,8 +456,6 @@ export class ClobClient {
     }
   }
 
-  // ── saveToSupabase ────────────────────────────────────────────────────────
-
   private async saveToSupabase(creds: L2Credentials): Promise<void> {
     try {
       const { error } = await supabase.from('bot_config').upsert(
@@ -300,38 +467,20 @@ export class ClobClient {
         },
         { onConflict: 'key' }
       )
-      if (error) { console.error('[CLOB] Error guardando en Supabase:', error.message) }
-      else        { console.log('[CLOB] ✅ Credenciales L2 persistidas en Supabase.') }
+      if (error) console.error('[CLOB] Error guardando en Supabase:', error.message)
+      else        console.log('[CLOB] ✅ Credenciales L2 persistidas en Supabase.')
     } catch (err) {
       console.error('[CLOB] Excepción guardando en Supabase:', (err as Error).message)
     }
   }
 
-  // ── deriveAndPersist ──────────────────────────────────────────────────────
-
-  private async deriveAndPersist(): Promise<L2Credentials> {
-    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, this.ethersSigner as any)
-
-    let rawCreds: { key: string; secret: string; passphrase: string }
+  async clearSupabaseCredentials(): Promise<void> {
+    this.memCache = null
     try {
-      rawCreds = await tempClient.createOrDeriveApiKey()
-    } catch (err: any) {
-      console.error('[CLOB] Error derivando API key:', err?.message)
-      throw err
+      await supabase.from('bot_config').delete().eq('key', SUPABASE_CREDS_KEY)
+      console.log('[CLOB] Credenciales L2 eliminadas de Supabase.')
+    } catch (err) {
+      console.error('[CLOB] Error eliminando credenciales:', (err as Error).message)
     }
-
-    const creds: L2Credentials = {
-      apiKey:        rawCreds.key,
-      apiSecret:     rawCreds.secret,
-      apiPassphrase: rawCreds.passphrase,
-      walletAddress: this.wallet.address,
-      derivedAt:     new Date().toISOString(),
-    }
-
-    console.log(`[CLOB] ✅ Credenciales derivadas — apiKey: ${creds.apiKey.substring(0, 8)}…`)
-    console.log('[CLOB] ⬆️  Copia a Railway: CLOB_API_KEY / CLOB_API_SECRET / CLOB_API_PASSPHRASE')
-
-    await this.saveToSupabase(creds)
-    return creds
   }
 }
