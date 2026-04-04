@@ -131,8 +131,8 @@ export class ClobClient {
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
       },
-      this.wallet.address,      // funder — wallet que tiene el USDC
       0 as any,                 // signatureType EOA = 0
+      this.wallet.address,      // funder — wallet que tiene el USDC
     )
   }
 
