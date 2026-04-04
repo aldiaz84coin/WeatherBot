@@ -151,25 +151,17 @@ export class ClobClient {
 
     const client = await this.buildPolyClient()
 
-    // ── Pre-check de balance ──────────────────────────────────────────────
-    // FIX: hay que pasar { assetType: AssetType.COLLATERAL } para leer el
-    // balance USDC. Sin este parámetro el SDK devuelve 0 aunque haya fondos.
+    // ── Diagnóstico de balance (solo log, no bloquea la orden) ──────────────
+    // getBalanceAllowance refleja la allowance on-chain del CTF Exchange,
+    // que puede devolver 0 aunque haya USDC disponible para operar.
+    // Si realmente no hay fondos, el CLOB rechazará la orden con su propio error.
     try {
-      const balRes  = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
-      const balance = parseFloat((balRes as any)?.balance ?? '0')
-      console.log(`[CLOB] Balance USDC en CLOB: ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(balRes)})`)
-
-      if (balance < params.size) {
-        throw new Error(
-          `[CLOB] Balance insuficiente: tienes ${balance.toFixed(4)} USDC, necesitas ${params.size.toFixed(4)} USDC. ` +
-          `Fondea la wallet ${this.wallet.address} en Polygon.`
-        )
-      }
+      const balRes    = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+      const balance   = parseFloat((balRes as any)?.balance   ?? '0')
+      const allowance = parseFloat((balRes as any)?.allowance ?? '0')
+      console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)} | Allowance: ${allowance.toFixed(4)} | Necesario: ${params.size.toFixed(4)}`)
     } catch (err: any) {
-      // Si el pre-check falla por razones de red/API, logamos pero NO bloqueamos la orden
-      // (el CLOB rechazará la orden igualmente si no hay fondos)
-      if (err.message?.startsWith('[CLOB] Balance insuficiente')) throw err
-      console.warn('[CLOB] No se pudo verificar el balance previo:', err?.message)
+      console.warn('[CLOB] No se pudo consultar balance:', err?.message)
     }
 
     // ── negRisk ───────────────────────────────────────────────────────────
