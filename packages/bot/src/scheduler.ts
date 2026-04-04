@@ -21,14 +21,14 @@ import cron from 'node-cron'
 import { runDailyPrediction } from './prediction/predict'
 import { runDailySettlement  } from './prediction/settle'
 import { runPriceSnapshot    } from './prediction/price-snapshot'
-import { startJobRunner      } from './jobs/job-runner'
+import { startJobRunner, checkAndRunPendingJobs } from './jobs/job-runner'
 
 import { runBettingCycle            } from './betting/engine'
 import { settleBettingCycle         } from './betting/settle-cycle'
 import { runDailyAnalysis           } from './betting/daily-analysis'
 import { checkAndExecuteLiveSwitch  } from './betting/live-switch'
 import { checkAndRetryOrders        } from './betting/retry-orders'
-import { checkAndRetryBettingCycle  } from './betting/retry-cycle'   // ← AÑADIDO
+import { checkAndRetryBettingCycle  } from './betting/retry-cycle'
 import { botLogger                  } from './betting/logger'
 
 const TZ = 'Europe/Madrid'
@@ -48,11 +48,17 @@ const TZ = 'Europe/Madrid'
     nodeVersion: process.version,
   })
 
+  // FIX: startJobRunner() se llama UNA SOLA VEZ aquí en el startup.
+  // Crea internamente su propio setInterval(30s) y no debe llamarse de nuevo.
+  // Antes se llamaba dentro del cron de 30s, lo que acumulaba un nuevo
+  // setInterval en cada tick → fuga exponencial de queries a Supabase.
+  startJobRunner()
+
   // ── Verificar flags pendientes en startup ────────────────────────────────
   // Cubre el caso en que el bot se reinicia justo después de activar un flag
   try {
     await checkAndExecuteLiveSwitch()
-    await checkAndRetryBettingCycle()   // ← AÑADIDO
+    await checkAndRetryBettingCycle()
     await checkAndRetryOrders()
   } catch (err) {
     await botLogger.error('Error en checks de startup', err)
@@ -134,18 +140,18 @@ cron.schedule('0 23 * * *', async () => {
 }, { timezone: TZ })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CRON 7 — cada 30 s · JOB RUNNER (backtests + live-switch + retry ciclo/órdenes)
+// CRON 7 — cada 30 s · FLAGS (live-switch + retry ciclo/órdenes)
+// FIX: ya NO llama a startJobRunner() — el job runner tiene su propio
+//      setInterval iniciado en el startup. Aquí solo se comprueban los
+//      flags de control que el dashboard puede activar en cualquier momento.
 // ─────────────────────────────────────────────────────────────────────────────
 cron.schedule('*/30 * * * * *', async () => {
   try {
-    // Backtests solicitados desde el dashboard
-    await startJobRunner()
-
     // Transición simulated → live solicitada desde el dashboard
     await checkAndExecuteLiveSwitch()
 
     // Relanzar ciclo completo (predicción + órdenes) solicitado desde el dashboard
-    await checkAndRetryBettingCycle()   // ← AÑADIDO
+    await checkAndRetryBettingCycle()
 
     // Retry solo órdenes (ciclo ya existe) solicitado desde el dashboard
     await checkAndRetryOrders()
