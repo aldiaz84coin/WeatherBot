@@ -76,6 +76,18 @@ export class ClobClient {
     }
   }
 
+  // ── ethersSigner ─────────────────────────────────────────────────────────
+  // El SDK espera la interfaz ethers v5 (_signTypedData + getAddress).
+  // Adaptamos ethers v6 (signTypedData) para que sea compatible.
+
+  private get ethersSigner() {
+    return {
+      _signTypedData: (domain: any, types: any, value: any) =>
+        this.wallet.signTypedData(domain, types, value),
+      getAddress: () => Promise.resolve(this.wallet.address),
+    }
+  }
+
   // ── getCredentials ────────────────────────────────────────────────────────
 
   private async getCredentials(): Promise<L2Credentials> {
@@ -113,7 +125,7 @@ export class ClobClient {
     return new PolyClobClient(
       CLOB_HOST,
       Chain.POLYGON,
-      this.wallet as any,
+      this.ethersSigner,
       {
         key:        creds.apiKey,
         secret:     creds.apiSecret,
@@ -251,7 +263,7 @@ export class ClobClient {
   // ── deriveAndPersist ──────────────────────────────────────────────────────
 
   private async deriveAndPersist(): Promise<L2Credentials> {
-    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, this.wallet as any)
+    const tempClient = new PolyClobClient(CLOB_HOST, Chain.POLYGON, this.ethersSigner)
 
     let rawCreds: { key: string; secret: string; passphrase: string }
     try {
