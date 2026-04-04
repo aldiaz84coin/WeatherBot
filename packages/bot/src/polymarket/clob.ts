@@ -21,6 +21,7 @@
 //        automáticamente (self-healing ante revocaciones).
 
 import axios from 'axios'
+import crypto from 'crypto'
 import { ethers } from 'ethers'
 import { supabase } from '../db/supabase'
 
@@ -236,23 +237,30 @@ export class ClobClient {
   }
 
   // ── buildAuthHeaders ──────────────────────────────────────────────────────
-  // Genera los 5 headers que Polymarket exige en cada request autenticado.
-  // El POLY_SIGNATURE aquí firma {apiKey}{timestamp}{nonce}{passphrase}.
+  // Genera los headers L2 que Polymarket exige en cada request autenticado.
+  // La firma es HMAC-SHA256(base64decode(secret), timestamp+METHOD+path+body).
+  // Ref: https://docs.polymarket.com/#level-2-authentication
 
-  private async buildAuthHeaders(creds: L2Credentials): Promise<Record<string, string>> {
+  private buildAuthHeaders(
+    creds: L2Credentials,
+    method: string,
+    requestPath: string,
+    body?: string,
+  ): Record<string, string> {
     const timestamp = Math.floor(Date.now() / 1000).toString()
-    const nonce     = Math.floor(Math.random() * 1_000_000).toString()
 
-    const message   = `${creds.apiKey}${timestamp}${nonce}${creds.apiPassphrase}`
-    const signature = await this.wallet.signMessage(message)
+    // Mensaje: timestamp + METHOD + /path + body (vacío si GET)
+    const msg       = timestamp + method.toUpperCase() + requestPath + (body ?? '')
+    const secret    = Buffer.from(creds.apiSecret, 'base64')
+    const signature = crypto.createHmac('sha256', secret).update(msg).digest('base64')
 
     return {
-      'Content-Type':   'application/json',
-      'POLY_ADDRESS':   this.wallet.address,
-      'POLY_API_KEY':   creds.apiKey,
-      'POLY_SIGNATURE': signature,
-      'POLY_TIMESTAMP': timestamp,
-      'POLY_NONCE':     nonce,
+      'Content-Type':    'application/json',
+      'POLY_ADDRESS':    this.wallet.address,
+      'POLY_API_KEY':    creds.apiKey,
+      'POLY_PASSPHRASE': creds.apiPassphrase,
+      'POLY_SIGNATURE':  signature,
+      'POLY_TIMESTAMP':  timestamp,
     }
   }
 
@@ -260,7 +268,7 @@ export class ClobClient {
 
   async getBalance(): Promise<number> {
     const creds   = await this.getCredentials()
-    const headers = await this.buildAuthHeaders(creds)
+    const headers = this.buildAuthHeaders(creds, 'GET', '/balance')
     const res     = await axios.get(`${CLOB_BASE}/balance`, { headers, timeout: 10_000 })
     return res.data.balance
   }
@@ -293,8 +301,9 @@ export class ClobClient {
 
   private async doPlaceOrder(params: OrderParams): Promise<OrderResult> {
     const creds     = await this.getCredentials()
-    const headers   = await this.buildAuthHeaders(creds)
     const orderData = await this.buildSignedOrder(params)
+    const body      = JSON.stringify(orderData)
+    const headers   = this.buildAuthHeaders(creds, 'POST', '/order', body)
 
     const res = await axios.post(
       `${CLOB_BASE}/order`,
@@ -393,7 +402,7 @@ export class ClobClient {
 
   async getOrder(orderId: string): Promise<OrderResult> {
     const creds   = await this.getCredentials()
-    const headers = await this.buildAuthHeaders(creds)
+    const headers = this.buildAuthHeaders(creds, 'GET', `/order/${orderId}`)
 
     const res = await axios.get(
       `${CLOB_BASE}/order/${orderId}`,
