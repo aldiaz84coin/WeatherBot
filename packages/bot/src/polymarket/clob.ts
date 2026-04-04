@@ -199,9 +199,13 @@ export class ClobClient {
       const status = err?.response?.status
       const body   = err?.response?.data
 
-      // 400 con "already exists" → la key ya fue derivada, recuperarla con GET
-      if (status === 400 && JSON.stringify(body ?? '').toLowerCase().includes('already exists')) {
-        console.log('[CLOB] API key ya existía en Polymarket — recuperando con GET…')
+      // 400 + "already exists" o 405 → la key ya fue derivada, recuperarla con GET
+      const keyAlreadyExists =
+        (status === 400 && JSON.stringify(body ?? '').toLowerCase().includes('already exists')) ||
+        status === 405
+
+      if (keyAlreadyExists) {
+        console.log(`[CLOB] API key ya existía en Polymarket (HTTP ${status}) — recuperando con GET…`)
         const getRes = await axios.get(
           `${CLOB_BASE}/auth/derive-api-key`,
           { headers: derivationHeaders, timeout: 12_000 }
