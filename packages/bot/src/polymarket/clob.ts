@@ -76,18 +76,6 @@ export class ClobClient {
     }
   }
 
-  // ── ethersSigner ─────────────────────────────────────────────────────────
-  // El SDK espera la interfaz ethers v5 (_signTypedData + getAddress).
-  // Adaptamos ethers v6 (signTypedData) para que sea compatible.
-
-  private get ethersSigner() {
-    return {
-      _signTypedData: (domain: any, types: any, value: any) =>
-        this.wallet.signTypedData(domain, types, value),
-      getAddress: () => Promise.resolve(this.wallet.address),
-    }
-  }
-
   // ── getCredentials ────────────────────────────────────────────────────────
 
   private async getCredentials(): Promise<L2Credentials> {
@@ -119,20 +107,29 @@ export class ClobClient {
   }
 
   // ── buildPolyClient ───────────────────────────────────────────────────────
+  // Pasamos la private key como string directamente, igual que py_clob_client
+  // (key=private_key). El signer adapter de ethers v6 no es compatible con
+  // cómo el SDK firma internamente (usa ethers v5 internamente).
 
   private async buildPolyClient(): Promise<PolyClobClient> {
     const creds = await this.getCredentials()
+
+    // Sin prefijo 0x — igual que Python
+    const rawKey = this.privateKey.startsWith('0x')
+      ? this.privateKey.slice(2)
+      : this.privateKey
+
     return new PolyClobClient(
       CLOB_HOST,
       Chain.POLYGON,
-      this.ethersSigner,
+      rawKey as any,            // private key string directamente (como Python key=private_key)
       {
         key:        creds.apiKey,
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
       },
-      0 as any,                 // signatureType EOA = 0
-      this.wallet.address,      // funder — wallet que tiene el USDC
+      0 as any,                 // signatureType 0 = EOA
+      this.wallet.address,      // funder — wallet con el USDC
     )
   }
 
