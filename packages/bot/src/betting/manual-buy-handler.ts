@@ -26,10 +26,10 @@ interface ManualBuyPayload {
 }
 
 export async function checkAndExecuteManualBuy(): Promise<void> {
-  const raw = await getConfigValue<ManualBuyPayload | boolean>('pending_manual_buy')
+  const raw = await getConfigValue<unknown>('pending_manual_buy')
 
-  // Si el flag no existe, es false, o es un objeto vacío → salir
-  if (!raw || raw === false || typeof raw !== 'object') return
+  // Si el flag no existe, es false, null, o no es un objeto con datos → salir
+  if (!raw || typeof raw !== 'object') return
 
   const payload = raw as ManualBuyPayload
 
