@@ -116,10 +116,10 @@ export async function POST(req: NextRequest) {
   }
 
   // ── 3. Calcular resultado ────────────────────────────────────────────────
-  const actualTemp    = Number(resolvedTemp)
-  const roundedTemp   = Math.round(actualTemp)
-  const won           = roundedTemp === cycle.token_a_temp || roundedTemp === cycle.token_b_temp
-  const winningToken  = won
+  const actualTemp   = Number(resolvedTemp)
+  const roundedTemp  = Math.round(actualTemp)
+  const won          = roundedTemp === cycle.token_a_temp || roundedTemp === cycle.token_b_temp
+  const winningToken = won
     ? (roundedTemp === cycle.token_a_temp ? cycle.token_a_temp : cycle.token_b_temp)
     : null
 
@@ -174,15 +174,15 @@ export async function POST(req: NextRequest) {
   }
 
   // ── 6. Log en bot_events ──────────────────────────────────────────────────
+  // FIX: campos correctos según schema — severity / event_type / payload (no level/category/metadata)
   await supabase.from('bot_events').insert({
-    event_type:  won ? 'success' : 'warn',
-    category:    'settlement',
-    message:     won
+    severity:   won ? 'success' : 'warn',
+    event_type: 'settlement',
+    message:    won
       ? `✅ [MANUAL] GANADO ${date} — temp real: ${actualTemp}°C → token ${winningToken}°C. P&L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} USDC`
       : `❌ [MANUAL] PERDIDO ${date} — temp real: ${actualTemp}°C, tokens: ${cycle.token_a_temp}°C/${cycle.token_b_temp}°C. P&L: ${pnl.toFixed(4)} USDC`,
-    metadata:    { actualTemp, won, pnl, winningToken, source: 'dashboard_manual' },
-    cycle_id:    cycle.id,
-    created_at:  new Date().toISOString(),
+    payload:  { actualTemp, won, pnl, winningToken, source: 'dashboard_manual' },
+    cycle_id: cycle.id,
   })
 
   return NextResponse.json({
