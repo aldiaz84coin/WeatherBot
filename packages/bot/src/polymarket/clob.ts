@@ -8,7 +8,7 @@
 // Credenciales L2 (apiKey, secret, passphrase):
 //   Prioridad: ENV vars (CLOB_API_KEY/SECRET/PASSPHRASE) → Supabase → derivación
 
-import { ClobClient as PolyClobClient, Side, OrderType, Chain, AssetType } from '@polymarket/clob-client'
+import { ClobClient as PolyClobClient, Side, OrderType, Chain, AssetType, SignatureType } from '@polymarket/clob-client'
 import { ethers } from 'ethers'
 import { supabase } from '../db/supabase'
 
@@ -130,7 +130,9 @@ export class ClobClient {
         key:        creds.apiKey,
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
-      }
+      },
+      this.wallet.address,      // funder — wallet que tiene el USDC
+      SignatureType.EOA,        // EOA = 0, firma estándar de wallet privada
     )
   }
 
