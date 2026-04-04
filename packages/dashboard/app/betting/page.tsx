@@ -5,8 +5,9 @@
 // El badge de modo (simulado/live) se renderiza en BettingEngine con datos reales.
 // ──────────────────────────────────────────────────────────────────────────────
 
-import { BettingEngine } from '../../components/BettingEngine'
-import { BotEventLog }   from '../../components/BotEventLog'
+import { BettingEngine }  from '../../components/BettingEngine'
+import { BotEventLog }    from '../../components/BotEventLog'
+import { ManualBuyPanel } from '../../components/ManualBuyPanel'
 
 export const revalidate = 30
 
@@ -24,6 +25,9 @@ export default function BettingPage() {
 
       {/* Motor de apuestas (KPIs + ciclo actual + historial + badge modo) */}
       <BettingEngine />
+
+      {/* Compra manual — fuera del ciclo automático, con debug Polymarket */}
+      <ManualBuyPanel />
 
       {/* Log de eventos del bot en tiempo real */}
       <div>
