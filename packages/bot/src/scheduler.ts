@@ -29,6 +29,7 @@ import { runDailyAnalysis           } from './betting/daily-analysis'
 import { checkAndExecuteLiveSwitch  } from './betting/live-switch'
 import { checkAndRetryOrders        } from './betting/retry-orders'
 import { checkAndRetryBettingCycle  } from './betting/retry-cycle'
+import { checkAndExecuteManualBuy   } from './betting/manual-buy-handler'
 import { botLogger                  } from './betting/logger'
 
 const TZ = 'Europe/Madrid'
@@ -60,6 +61,7 @@ const TZ = 'Europe/Madrid'
     await checkAndExecuteLiveSwitch()
     await checkAndRetryBettingCycle()
     await checkAndRetryOrders()
+    await checkAndExecuteManualBuy()
   } catch (err) {
     await botLogger.error('Error en checks de startup', err)
   }
@@ -155,6 +157,9 @@ cron.schedule('*/30 * * * * *', async () => {
 
     // Retry solo órdenes (ciclo ya existe) solicitado desde el dashboard
     await checkAndRetryOrders()
+
+    // Compra manual solicitada desde el dashboard (panel ManualBuyPanel)
+    await checkAndExecuteManualBuy()
   } catch (err) {
     await botLogger.error('Error en job runner (30 s)', err)
   }
