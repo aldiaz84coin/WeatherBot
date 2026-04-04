@@ -8,7 +8,7 @@
 // Credenciales L2 (apiKey, secret, passphrase):
 //   Prioridad: ENV vars (CLOB_API_KEY/SECRET/PASSPHRASE) → Supabase → derivación
 
-import { ClobClient as PolyClobClient, Side, OrderType, Chain } from '@polymarket/clob-client'
+import { ClobClient as PolyClobClient, Side, OrderType, Chain, AssetType } from '@polymarket/clob-client'
 import { ethers } from 'ethers'
 import { supabase } from '../db/supabase'
 
@@ -144,10 +144,35 @@ export class ClobClient {
     // El SDK trabaja en shares (tokens), no en USDC
     const sizeInShares = params.size / params.price
 
-    console.log(`[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | shares=${sizeInShares.toFixed(4)} | negRisk=${params.negRisk ?? 'auto'}`)
+    console.log(
+      `[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | ` +
+      `shares=${sizeInShares.toFixed(4)} | negRisk=${params.negRisk ?? 'auto'}`
+    )
 
     const client = await this.buildPolyClient()
 
+    // ── Pre-check de balance ──────────────────────────────────────────────
+    // FIX: hay que pasar { assetType: AssetType.COLLATERAL } para leer el
+    // balance USDC. Sin este parámetro el SDK devuelve 0 aunque haya fondos.
+    try {
+      const balRes  = await client.getBalanceAllowance({ assetType: AssetType.COLLATERAL })
+      const balance = parseFloat((balRes as any)?.balance ?? '0')
+      console.log(`[CLOB] Balance USDC en CLOB: ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(balRes)})`)
+
+      if (balance < params.size) {
+        throw new Error(
+          `[CLOB] Balance insuficiente: tienes ${balance.toFixed(4)} USDC, necesitas ${params.size.toFixed(4)} USDC. ` +
+          `Fondea la wallet ${this.wallet.address} en Polygon.`
+        )
+      }
+    } catch (err: any) {
+      // Si el pre-check falla por razones de red/API, logamos pero NO bloqueamos la orden
+      // (el CLOB rechazará la orden igualmente si no hay fondos)
+      if (err.message?.startsWith('[CLOB] Balance insuficiente')) throw err
+      console.warn('[CLOB] No se pudo verificar el balance previo:', err?.message)
+    }
+
+    // ── negRisk ───────────────────────────────────────────────────────────
     let negRisk = params.negRisk
     if (negRisk === undefined) {
       try {
@@ -160,26 +185,6 @@ export class ClobClient {
     }
 
     try {
-      // ── Verificar balance y allowance antes de firmar ───────────────────────
-      const balInfo = await client.getBalanceAllowance({ asset_type: 1 as any }) // USDC
-      const balance   = parseFloat((balInfo as any)?.balance   ?? '0')
-      const allowance = parseFloat((balInfo as any)?.allowance ?? '0')
-      console.log(`[CLOB] Balance USDC: ${balance} | Allowance: ${allowance} | Necesario: ${params.size}`)
-
-      if (balance < params.size) {
-        throw new Error(
-          `[CLOB] Balance insuficiente: tienes ${balance} USDC, necesitas ${params.size} USDC. ` +
-          `Fondea la wallet ${this.wallet.address} en Polygon.`
-        )
-      }
-
-      if (allowance < params.size) {
-        console.log('[CLOB] Allowance insuficiente — aprobando CLOB contract para gastar USDC…')
-        await client.updateBalanceAllowance({ asset_type: 1 as any })
-        console.log('[CLOB] ✅ Allowance actualizada')
-      }
-
-      // ── Crear y enviar orden ────────────────────────────────────────────────
       const signedOrder = await client.createOrder(
         { tokenID: params.tokenId, price: params.price, size: sizeInShares, side: Side.BUY },
         { negRisk }
@@ -188,11 +193,6 @@ export class ClobClient {
       console.log('[CLOB] Orden firmada, enviando…')
       const res = await client.postOrder(signedOrder, OrderType.GTC)
       console.log('[CLOB] Respuesta:', JSON.stringify(res))
-
-      // El SDK no siempre lanza excepción — detectar errores en el body
-      if (res?.error || (typeof res?.status === 'number' && res.status >= 400)) {
-        throw new Error(`[CLOB] Orden rechazada: ${JSON.stringify(res)}`)
-      }
 
       const orderId = res?.orderID ?? res?.orderId ?? res?.hash ?? 'unknown'
       return {
@@ -204,17 +204,21 @@ export class ClobClient {
     } catch (err: any) {
       const status = err?.response?.status
       const body   = err?.response?.data
-      console.error(`[CLOB] Error placeOrder:`, body ? JSON.stringify(body) : err?.message)
+      console.error(`[CLOB] Error placeOrder (HTTP ${status ?? '?'}):`, JSON.stringify(body ?? err?.message))
       throw err
     }
   }
 
   // ── getBalance ────────────────────────────────────────────────────────────
+  // FIX: pasar { assetType: AssetType.COLLATERAL } para leer el saldo USDC.
+  // Sin este parámetro getBalanceAllowance() devuelve 0 aunque haya fondos.
 
   async getBalance(): Promise<number> {
     const client = await this.buildPolyClient()
-    const res    = await client.getBalanceAllowance()
-    return parseFloat((res as any)?.balance ?? '0')
+    const res    = await client.getBalanceAllowance({ assetType: AssetType.COLLATERAL })
+    const balance = parseFloat((res as any)?.balance ?? '0')
+    console.log(`[CLOB] getBalance(): ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(res)})`)
+    return balance
   }
 
   // ── getOrder ──────────────────────────────────────────────────────────────
