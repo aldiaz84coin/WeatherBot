@@ -4,6 +4,9 @@
 // Proxy server-side para los datos del motor de apuestas.
 // El browser llama a esta ruta (mismo origen → sin CORS).
 // Esta ruta llama a Supabase desde Vercel (sin restricciones de red).
+//
+// FIX: betting_mode en v_betting_status viene como '"live"' (con comillas JSONB)
+//      porque la vista hace value::text en SQL. Se normalizan aquí antes de devolver.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
@@ -58,6 +61,13 @@ export async function GET(req: NextRequest) {
     if (e1) return NextResponse.json({ error: e1.message }, { status: 500 })
     if (e2) return NextResponse.json({ error: e2.message }, { status: 500 })
     // e3: si no existe ciclo de mañana es null, no es error
+
+    // ── FIX: normalizar betting_mode — la vista hace value::text en PostgreSQL
+    // que convierte JSONB string '"live"' → texto '"live"' (con comillas literales).
+    // Aquí las eliminamos para que el componente pueda comparar con === 'live'.
+    if (status && typeof status.betting_mode === 'string') {
+      status.betting_mode = status.betting_mode.replace(/^"|"$/g, '')
+    }
 
     return NextResponse.json({
       status:        status ?? null,
