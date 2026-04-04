@@ -97,7 +97,11 @@ function toShares(amount: number): bigint {
   return BigInt(Math.round(amount * 1_000_000))
 }
 
-/** HMAC-SHA256 para headers L2 — igual que py-clob-client */
+/** HMAC-SHA256 para headers L2 — replica exactamente py-clob-client/signing/hmac.py
+ *
+ * Python: base64.urlsafe_b64decode(secret) → hmac-sha256 → base64.urlsafe_b64encode
+ * Headers con underscore: POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_API_KEY, POLY_PASSPHRASE
+ */
 function buildL2Headers(
   creds:     L2Credentials,
   method:    string,
@@ -105,16 +109,28 @@ function buildL2Headers(
   body:      string,
   timestamp: number,
 ): Record<string, string> {
-  const message  = `${timestamp}${method}${path}${body}`
-  const hmac     = createHmac('sha256', Buffer.from(creds.apiSecret, 'base64'))
+  // urlsafe base64 decode del secret (igual que Python: base64.urlsafe_b64decode)
+  const secretBytes = Buffer.from(creds.apiSecret.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+
+  // mensaje = timestamp + METHOD_UPPER + path [+ body si no vacío]
+  const message = body
+    ? `${timestamp}${method.toUpperCase()}${path}${body}`
+    : `${timestamp}${method.toUpperCase()}${path}`
+
+  const hmac = createHmac('sha256', secretBytes)
   hmac.update(message)
+
+  // urlsafe base64 encode del digest (igual que Python: base64.urlsafe_b64encode)
   const signature = hmac.digest('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
 
   return {
-    'POLY-API-KEY':     creds.apiKey,
-    'POLY-PASSPHRASE':  creds.apiPassphrase,
-    'POLY-TIMESTAMP':   String(timestamp),
-    'POLY-SIGNATURE':   signature,
+    'POLY_ADDRESS':    creds.walletAddress,
+    'POLY_SIGNATURE':  signature,
+    'POLY_TIMESTAMP':  String(timestamp),
+    'POLY_API_KEY':    creds.apiKey,
+    'POLY_PASSPHRASE': creds.apiPassphrase,
   }
 }
 
@@ -315,18 +331,20 @@ export class ClobClient {
 
   async getBalance(): Promise<number> {
     const creds     = await this.getCredentials()
-    const path      = '/balance-allowance?asset_type=0'
+    // El HMAC se firma sobre el path SIN query params (igual que py-clob-client)
+    const signPath  = '/balance-allowance'
+    const fullPath  = '/balance-allowance?asset_type=COLLATERAL&signature_type=1'
     const timestamp = Math.floor(Date.now() / 1000)
-    const l2Headers = buildL2Headers(creds, 'GET', path, '', timestamp)
+    const l2Headers = buildL2Headers(creds, 'GET', signPath, '', timestamp)
 
     try {
-      const res  = await fetch(`${CLOB_HOST}${path}`, {
+      const res  = await fetch(`${CLOB_HOST}${fullPath}`, {
         headers: l2Headers,
         signal:  AbortSignal.timeout(8_000),
       })
       const data = await res.json() as any
       const balance = parseFloat(data?.balance ?? '0')
-      console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)}`)
+      console.log(`[CLOB] Balance USDC: ${balance.toFixed(4)} (raw: ${JSON.stringify(data)})`)
       return balance
     } catch (err) {
       console.warn('[CLOB] No se pudo consultar balance:', err)
