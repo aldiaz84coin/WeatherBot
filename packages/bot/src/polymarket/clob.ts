@@ -73,7 +73,6 @@ export class ClobClient {
       console.log('[CLOB] ✅ Addresses coinciden')
     }
 
-    // Prioridad 0: credenciales L2 inyectadas por env vars
     const envKey        = process.env.CLOB_API_KEY
     const envSecret     = process.env.CLOB_API_SECRET
     const envPassphrase = process.env.CLOB_API_PASSPHRASE
@@ -344,7 +343,6 @@ export class ClobClient {
         price:      res.data.price      ?? params.price,
       }
     } catch (err: any) {
-      // Log completo del body de error para diagnóstico
       console.error('[CLOB] Error POST /order — response body:', JSON.stringify(err?.response?.data))
       throw err
     }
@@ -373,12 +371,11 @@ export class ClobClient {
       expiration:    '0',
       nonce:         '0',
       feeRateBps:    '0',
-      side:          params.side === 'BUY' ? 0 : 1,
-      signatureType: 0,  // EOA (Externally Owned Account)
+      side:          (params.side === 'BUY' ? 0 : 1).toString(),
+      signatureType: '0',  // EOA (Externally Owned Account)
     }
 
-    // Dominio EIP-712 de Polymarket CTF Exchange en Polygon mainnet
-    // verifyingContract: CTF Exchange — https://polygonscan.com/address/0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+    // Dominio EIP-712 del CTF Exchange de Polymarket en Polygon mainnet
     const domain = {
       name:              'CTF Exchange',
       version:           '1',
