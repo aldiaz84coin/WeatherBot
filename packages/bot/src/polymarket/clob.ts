@@ -189,7 +189,15 @@ export class ClobClient {
     const creds   = await this.getCredentials()
     const negRisk = params.negRisk ?? await this.getNegRisk(params.tokenId)
 
-    // ── 1. Calcular amounts ───────────────────────────────────────────────
+    // ── 1. Fetch feeRateBps dinámico desde /fee-rate ──────────────────────
+    // CRÍTICO: desde 2026, weather markets también tienen fees.
+    // Si feeRateBps no coincide con el valor del servidor → Invalid order payload
+    // Docs: GET https://clob.polymarket.com/fee-rate?token_id={token_id}
+    const feeRateBpsInt = await this.getFeeRate(params.tokenId)
+    const feeRateBps    = BigInt(feeRateBpsInt)
+    console.log(`[CLOB] feeRateBps=${feeRateBpsInt} para token ${params.tokenId.substring(0, 16)}…`)
+
+    // ── 2. Calcular amounts ───────────────────────────────────────────────
     // BUY: makerAmount = USDC a gastar, takerAmount = shares a recibir
     // Python: size = stake / price  (en units de token)
     const sharesFloat  = params.size / params.price    // shares = usdc / price
@@ -198,18 +206,17 @@ export class ClobClient {
 
     console.log(
       `[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | ` +
-      `shares=${sharesFloat.toFixed(4)} | negRisk=${negRisk}`
+      `shares=${sharesFloat.toFixed(4)} | negRisk=${negRisk} | feeRateBps=${feeRateBpsInt}`
     )
     console.log(`[CLOB] makerAmount=${makerAmount} | takerAmount=${takerAmount}`)
 
-    // ── 2. Construir struct de la orden ───────────────────────────────────
+    // ── 3. Construir struct EIP-712 de la orden ───────────────────────────
     // Igual que OrderData en py-clob-client/signing/model.py
-    const salt        = BigInt(Math.floor(Math.random() * 1_000_000_000_000))
-    const expiration  = BigInt(0)    // GTC (no expira)
-    const nonce       = BigInt(0)
-    const feeRateBps  = BigInt(0)
-    const sideValue   = BigInt(0)    // 0 = BUY
-    const sigType     = BigInt(1)    // 1 = POLY_PROXY (signature_type en Python)
+    const salt       = BigInt(Math.floor(Math.random() * 1_000_000_000_000))
+    const expiration = BigInt(0)    // GTC (no expira)
+    const nonce      = BigInt(0)
+    const sideValue  = BigInt(0)    // 0 = BUY
+    const sigType    = BigInt(1)    // 1 = POLY_PROXY (signature_type en Python)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
     const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
@@ -224,12 +231,12 @@ export class ClobClient {
       takerAmount:   takerAmount,
       expiration:    expiration,
       nonce:         nonce,
-      feeRateBps:    feeRateBps,
+      feeRateBps:    feeRateBps,      // ← valor real del servidor
       side:          sideValue,
       signatureType: sigType,
     }
 
-    // ── 3. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
+    // ── 4. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
     const domain = {
       ...EIP712_DOMAIN,
       verifyingContract: exchange,
@@ -244,8 +251,8 @@ export class ClobClient {
       throw err
     }
 
-    // ── 4. Construir payload JSON para POST /order ────────────────────────
-    // Formato esperado por el CLOB REST API (igual que py-clob-client)
+    // ── 5. Construir payload JSON para POST /order ────────────────────────
+    // side debe ser número (0), NO string 'BUY' — confirmado en SignedOrder interface
     const orderPayload = {
       salt:          salt.toString(),
       maker:         this.wallet.address,
@@ -256,8 +263,8 @@ export class ClobClient {
       takerAmount:   takerAmount.toString(),
       expiration:    expiration.toString(),
       nonce:         nonce.toString(),
-      feeRateBps:    feeRateBps.toString(),
-      side:          'BUY',
+      feeRateBps:    feeRateBps.toString(),   // ← valor real del servidor
+      side:          0,                        // ← número, no string
       signatureType: 1,
       signature,
     }
@@ -324,6 +331,31 @@ export class ClobClient {
       return !!markets[0]?.neg_risk
     } catch {
       return false
+    }
+  }
+
+  // ── getFeeRate ────────────────────────────────────────────────────────────
+  // GET /fee-rate?token_id=... → devuelve el feeRateBps actual del mercado.
+  // CRÍTICO: debe incluirse en el payload firmado. 0 para mercados sin fee.
+  // Docs: https://docs.polymarket.com/trading/fees
+
+  async getFeeRate(tokenId: string): Promise<number> {
+    try {
+      const res = await fetch(
+        `${CLOB_HOST}/fee-rate?token_id=${encodeURIComponent(tokenId)}`,
+        { signal: AbortSignal.timeout(8_000) }
+      )
+      if (!res.ok) {
+        console.warn(`[CLOB] /fee-rate respondió ${res.status} — usando feeRateBps=0`)
+        return 0
+      }
+      const data = await res.json() as any
+      // Respuesta: { "fee_rate_bps": "0" } o { "fee_rate_bps": "100" }
+      const rate = parseInt(data?.fee_rate_bps ?? data?.feeRateBps ?? '0', 10)
+      return isNaN(rate) ? 0 : rate
+    } catch (err) {
+      console.warn('[CLOB] No se pudo consultar fee-rate:', err, '— usando 0')
+      return 0
     }
   }
 
