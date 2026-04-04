@@ -126,17 +126,11 @@ export class ClobClient {
   private async buildPolyClient(): Promise<PolyClobClient> {
     const creds = await this.getCredentials()
 
-    // funder = proxy wallet donde está el USDC (distinto del EOA que firma)
-    // Configura POLYMARKET_PROXY_WALLET con la dirección que aparece en
-    // polymarket.com → Settings. Si no está definida, usa el EOA (type 0).
-    const proxyWallet   = process.env.POLYMARKET_PROXY_WALLET
-    const funder        = proxyWallet ?? this.wallet.address
-    const signatureType = proxyWallet ? 1 : 0   // 1=POLY_PROXY, 0=EOA
-
-    console.log(`[CLOB] Funder: ${funder} | signatureType: ${signatureType}`)
-    if (!proxyWallet) {
-      console.warn('[CLOB] ⚠️  POLYMARKET_PROXY_WALLET no definida — usando EOA como funder (puede fallar si los fondos están en el proxy)')
-    }
+    // POLY_PROXY (signatureType=1): funder = EOA (la dirección que controla el proxy).
+    // El CLOB con tipo 1 busca automáticamente el proxy wallet asociado al EOA
+    // para verificar el balance — NO hay que pasar la dirección del proxy como funder.
+    // Python: signature_type=1, funder=cfg["polymarket"]["funder"] = EOA address.
+    console.log(`[CLOB] Funder: ${this.wallet.address} | signatureType: 1 (POLY_PROXY)`)
 
     return new PolyClobClient(
       CLOB_HOST,
@@ -147,8 +141,8 @@ export class ClobClient {
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
       },
-      signatureType as any,
-      funder,
+      1 as any,                 // POLY_PROXY: el CLOB busca el proxy del EOA para el balance
+      this.wallet.address,      // funder = EOA (no el proxy) — igual que Python
     )
   }
 
