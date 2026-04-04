@@ -155,7 +155,7 @@ export class ClobClient {
     // FIX: hay que pasar { assetType: AssetType.COLLATERAL } para leer el
     // balance USDC. Sin este parámetro el SDK devuelve 0 aunque haya fondos.
     try {
-      const balRes  = await client.getBalanceAllowance({ assetType: AssetType.COLLATERAL })
+      const balRes  = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
       const balance = parseFloat((balRes as any)?.balance ?? '0')
       console.log(`[CLOB] Balance USDC en CLOB: ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(balRes)})`)
 
@@ -215,7 +215,7 @@ export class ClobClient {
 
   async getBalance(): Promise<number> {
     const client = await this.buildPolyClient()
-    const res    = await client.getBalanceAllowance({ assetType: AssetType.COLLATERAL })
+    const res    = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
     const balance = parseFloat((res as any)?.balance ?? '0')
     console.log(`[CLOB] getBalance(): ${balance.toFixed(4)} USDC (raw: ${JSON.stringify(res)})`)
     return balance
