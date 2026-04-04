@@ -1,15 +1,15 @@
 'use client'
 // packages/dashboard/components/BettingEngine.tsx
+//
+// CAMBIO: las queries de Supabase se hacen ahora via /api/betting/status
+// (server-side) en lugar de directamente desde el browser.
+// Esto evita errores CORS en redes corporativas que bloquean *.supabase.co.
+// El Realtime WebSocket también se elimina (bloqueado por las mismas redes);
+// se usa polling cada 60 s como única fuente de refresco.
 
 import { useEffect, useState, useCallback } from 'react'
-import { createClient } from '@supabase/supabase-js'
 import { format, parseISO } from 'date-fns'
 import { es } from 'date-fns/locale'
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ interface BettingStatus {
   cost_a_usdc:        number | null
   cost_b_usdc:        number | null
   actual_temp:        number | null
-  is_settled:         boolean
+  is_settled:         boolean | null
   latest_pnl:         number | null
   simulated:          boolean | null
   base_stake:         number | null
@@ -45,13 +45,13 @@ interface BettingCycle {
   target_date:   string
   stake_usdc:    number
   multiplier:    number
-  token_a_temp:  number
-  token_b_temp:  number
+  token_a_temp:  number | null
+  token_b_temp:  number | null
   actual_temp:   number | null
   status:        string
   pnl_usdc:      number | null
   simulated:     boolean
-  capped_at_max: boolean
+  capped_at_max: boolean | null
 }
 
 interface TomorrowCycle {
@@ -59,8 +59,8 @@ interface TomorrowCycle {
   target_date:       string
   stake_usdc:        number
   multiplier:        number
-  token_a_temp:      number
-  token_b_temp:      number
+  token_a_temp:      number | null
+  token_b_temp:      number | null
   status:            string
   simulated:         boolean
   prediction_id:     string | null
@@ -74,31 +74,18 @@ interface TomorrowCycle {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getMadridTomorrow(): string {
-  const todayMadrid = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid' }).format(new Date())
-  const [y, m, d] = todayMadrid.split('-').map(Number)
-  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10)
+  const now = new Date()
+  const madridStr = now.toLocaleString('en-CA', {
+    timeZone: 'Europe/Madrid',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const [y, m, d] = madridStr.split(/[-/]/).map(Number)
+  const tomorrow = new Date(Date.UTC(y, m - 1, d + 1))
+  return format(tomorrow, 'yyyy-MM-dd')
 }
 
-function statusBadge(status: string | null) {
-  switch (status) {
-    case 'open':    return 'bg-blue-950 text-blue-300 border-blue-800'
-    case 'won':     return 'bg-green-950 text-green-300 border-green-800'
-    case 'lost':    return 'bg-red-950 text-red-300 border-red-800'
-    case 'pending': return 'bg-gray-800 text-gray-400 border-gray-700'
-    case 'error':   return 'bg-orange-950 text-orange-300 border-orange-800'
-    default:        return 'bg-gray-800 text-gray-500 border-gray-700'
-  }
-}
-
-function statusLabel(status: string | null) {
-  switch (status) {
-    case 'open':    return '⏳ Abierto'
-    case 'won':     return '✅ Ganado'
-    case 'lost':    return '❌ Perdido'
-    case 'pending': return '⌛ Pendiente'
-    case 'error':   return '⚠️ Error'
-    default:        return status ?? '—'
-  }
+function formatTemp(t: number | null): string {
+  return t != null ? `${t.toFixed(1)}°C` : '—'
 }
 
 function pnlColor(pnl: number | null) {
@@ -112,6 +99,19 @@ function multiplierBar(mult: number | null, max: number | null, base: number | n
   const color = pct >= 80 ? 'bg-red-500' : pct >= 50 ? 'bg-yellow-500' : 'bg-blue-500'
   return { pct, color }
 }
+
+function statusBadge(status: string) {
+  const map: Record<string, string> = {
+    open:      'bg-blue-950 text-blue-400 border-blue-900',
+    won:       'bg-green-950 text-green-400 border-green-900',
+    lost:      'bg-red-950 text-red-400 border-red-900',
+    skipped:   'bg-gray-800 text-gray-500 border-gray-700',
+    cancelled: 'bg-gray-800 text-gray-500 border-gray-700',
+  }
+  return map[status] ?? 'bg-gray-800 text-gray-400 border-gray-700'
+}
+
+// ─── NoDataState ──────────────────────────────────────────────────────────────
 
 function NoDataState() {
   return (
@@ -158,57 +158,45 @@ function TomorrowCyclePanel({ cycle, onRefresh }: {
 
   return (
     <div className={`rounded-xl border p-4 ${
-      isLive ? 'bg-green-950/10 border-green-900' : 'bg-gray-900 border-gray-800'
+      isLive
+        ? 'bg-green-950/20 border-green-900'
+        : 'bg-gray-900 border-gray-800'
     }`}>
-      {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">Ciclo de mañana</p>
-          <span className="text-xs text-gray-500 font-mono">
-            {format(parseISO(cycle.target_date), 'dd MMM yyyy', { locale: es })}
-          </span>
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-0.5">Ciclo de mañana</p>
+          <p className="text-sm font-medium text-white">{cycle.target_date}</p>
         </div>
         <div className="flex items-center gap-2">
-          {cycle.simulated && (
-            <span className="text-[10px] text-yellow-600 border border-yellow-900 bg-yellow-950/30 rounded px-1.5 py-0.5">
-              simulado
-            </span>
-          )}
-          {isLive && (
-            <span className="text-[10px] text-green-400 border border-green-800 bg-green-950/40 rounded px-1.5 py-0.5">
-              🔴 live
-            </span>
-          )}
-          <span className={`text-xs px-2 py-0.5 rounded border ${statusBadge(cycle.status)}`}>
-            {statusLabel(cycle.status)}
+          <span className={`text-xs px-2 py-0.5 rounded border font-medium ${statusBadge(cycle.status)}`}>
+            {cycle.status}
+          </span>
+          <span className={`text-xs px-2 py-0.5 rounded border ${
+            isLive
+              ? 'bg-green-950 text-green-400 border-green-900'
+              : 'bg-yellow-950 text-yellow-600 border-yellow-900'
+          }`}>
+            {isLive ? '🔴 LIVE' : '🟡 SIM'}
           </span>
         </div>
       </div>
 
-      {/* Datos */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
         <div>
-          <p className="text-xs text-gray-600">Token A</p>
-          <p className="font-mono text-white font-semibold text-xl">{cycle.token_a_temp}°C</p>
-          {cycle.cost_a_usdc != null && (
-            <p className="text-xs text-gray-500">${cycle.cost_a_usdc.toFixed(4)}</p>
-          )}
+          <p className="text-xs text-gray-500">Stake</p>
+          <p className="text-sm font-semibold text-white">{cycle.stake_usdc} USDC</p>
         </div>
         <div>
-          <p className="text-xs text-gray-600">Token B</p>
-          <p className="font-mono text-white font-semibold text-xl">{cycle.token_b_temp}°C</p>
-          {cycle.cost_b_usdc != null && (
-            <p className="text-xs text-gray-500">${cycle.cost_b_usdc.toFixed(4)}</p>
-          )}
+          <p className="text-xs text-gray-500">Tokens</p>
+          <p className="text-sm font-semibold text-white">
+            {cycle.token_a_temp != null ? `${cycle.token_a_temp}°C` : '—'}
+            {' / '}
+            {cycle.token_b_temp != null ? `${cycle.token_b_temp}°C` : '—'}
+          </p>
         </div>
         <div>
-          <p className="text-xs text-gray-600">Stake · Mult</p>
-          <p className="font-mono text-white font-medium">{cycle.stake_usdc} USDC</p>
-          <p className="text-xs text-gray-500">×{cycle.multiplier}</p>
-        </div>
-        <div>
-          <p className="text-xs text-gray-600">Ensemble ajustado</p>
-          <p className="font-mono text-white font-medium">
+          <p className="text-xs text-gray-500">Ensemble ajustado</p>
+          <p className="text-sm font-semibold text-white">
             {cycle.ensemble_adjusted != null ? `${cycle.ensemble_adjusted.toFixed(2)}°C` : '—'}
           </p>
           {cycle.bias_applied != null && (
@@ -216,6 +204,10 @@ function TomorrowCyclePanel({ cycle, onRefresh }: {
               N: {cycle.bias_applied >= 0 ? '+' : ''}{cycle.bias_applied.toFixed(2)}°C
             </p>
           )}
+        </div>
+        <div>
+          <p className="text-xs text-gray-500">Multiplicador</p>
+          <p className="text-sm font-semibold text-white">{cycle.multiplier}×</p>
         </div>
       </div>
 
@@ -269,37 +261,16 @@ export function BettingEngine() {
 
   const tomorrowStr = getMadridTomorrow()
 
+  // ── Carga vía API route (server-side → sin CORS) ──────────────────────────
   const load = useCallback(async () => {
     setError(null)
     try {
-      const [
-        { data: st,  error: e1 },
-        { data: cy,  error: e2 },
-        { data: tmw, error: e3 },
-      ] = await Promise.all([
-        supabase.from('v_betting_status').select('*').maybeSingle(),
-        supabase
-          .from('betting_cycles')
-          .select('id,target_date,stake_usdc,multiplier,token_a_temp,token_b_temp,actual_temp,status,pnl_usdc,simulated,capped_at_max')
-          .order('target_date', { ascending: false })
-          .limit(20),
-        supabase
-          .from('betting_cycles')
-          .select(`
-            id, target_date, stake_usdc, multiplier,
-            token_a_temp, token_b_temp, status, simulated, prediction_id,
-            predictions (
-              ensemble_temp, ensemble_adjusted, bias_applied,
-              cost_a_usdc, cost_b_usdc,
-              token_a, token_b
-            )
-          `)
-          .eq('target_date', tomorrowStr)
-          .maybeSingle(),
-      ])
-      if (e1) throw new Error(e1.message)
-      if (e2) throw new Error(e2.message)
-      // e3: si no existe ciclo de mañana simplemente es null, no es error
+      const res = await fetch(`/api/betting/status?tomorrow=${tomorrowStr}`)
+      if (!res.ok) {
+        const d = await res.json()
+        throw new Error(d.error ?? `HTTP ${res.status}`)
+      }
+      const { status: st, cycles: cy, tomorrowCycle: tmw } = await res.json()
 
       setStatus(st)
       setCycles(cy ?? [])
@@ -311,8 +282,8 @@ export function BettingEngine() {
           target_date:       tmw.target_date,
           stake_usdc:        tmw.stake_usdc,
           multiplier:        tmw.multiplier,
-          token_a_temp:      tmw.token_a_temp ?? pred?.token_a ?? null,   // fallback a predictions.token_a
-          token_b_temp:      tmw.token_b_temp ?? pred?.token_b ?? null,   // fallback a predictions.token_b
+          token_a_temp:      tmw.token_a_temp ?? pred?.token_a ?? null,
+          token_b_temp:      tmw.token_b_temp ?? pred?.token_b ?? null,
           status:            tmw.status,
           simulated:         tmw.simulated,
           prediction_id:     tmw.prediction_id,
@@ -350,20 +321,14 @@ export function BettingEngine() {
     }
   }, [load])
 
+  // ── Polling cada 60s (sin Realtime WebSocket — bloqueado en redes corp.) ──
   useEffect(() => {
     load()
     const interval = setInterval(load, 60_000)
     return () => clearInterval(interval)
   }, [load])
 
-  useEffect(() => {
-    const channel = supabase
-      .channel('betting-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'betting_cycles' }, load)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_config' }, load)
-      .subscribe()
-    return () => { supabase.removeChannel(channel) }
-  }, [load])
+  // ── Render ────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -388,67 +353,79 @@ export function BettingEngine() {
 
   const bar = multiplierBar(
     status?.current_multiplier ?? null,
-    status?.max_stake && status?.base_stake ? status.max_stake / status.base_stake : null,
-    1,
+    status?.max_stake          ?? null,
+    status?.base_stake         ?? null,
   )
 
   return (
     <div className="space-y-4">
 
-      {/* ── Badge modo ── */}
-      {status?.betting_mode && (
-        <div className={`self-end inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-xs w-fit ml-auto ${
-          status.betting_mode === 'live'
-            ? 'bg-green-950 border-green-800 text-green-300'
-            : 'bg-yellow-950 border-yellow-800 text-yellow-300'
-        }`}>
-          <span>{status.betting_mode === 'live' ? '🔴' : '🧪'}</span>
-          <span className="font-medium">
-            {status.betting_mode === 'live' ? 'Modo Real (live)' : 'Modo Simulado'}
-          </span>
-        </div>
-      )}
-
-      {/* ── KPIs globales ── */}
+      {/* ── KPIs ── */}
       {status && (
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-          {[
-            { label: 'Ciclos totales', value: status.total_cycles ?? '—' },
-            { label: 'Hit rate',       value: status.hit_rate_pct != null ? `${status.hit_rate_pct}%` : '—' },
-            { label: 'P&L total',
-              value: status.total_pnl != null ? `${status.total_pnl >= 0 ? '+' : ''}${status.total_pnl} USDC` : '—',
-              color: status.total_pnl != null ? pnlColor(status.total_pnl) : undefined },
-            { label: 'Stake actual',   value: status.latest_stake != null ? `${status.latest_stake} USDC` : '—' },
-            { label: 'Multiplicador',  value: status.current_multiplier != null ? `×${status.current_multiplier}` : '—' },
-          ].map(kpi => (
-            <div key={kpi.label} className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-              <p className="text-xs text-gray-600 mb-1">{kpi.label}</p>
-              <p className={`text-lg font-mono font-semibold ${(kpi as any).color ?? 'text-white'}`}>
-                {kpi.value}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-medium text-gray-400 uppercase tracking-wider">
+              Estado del motor
+            </h2>
+            <div className="flex items-center gap-2">
+              <span className={`text-xs px-2 py-0.5 rounded border font-medium ${
+                status.betting_mode === 'live'
+                  ? 'bg-green-950 text-green-400 border-green-900'
+                  : 'bg-yellow-950 text-yellow-600 border-yellow-900'
+              }`}>
+                {status.betting_mode === 'live' ? '🔴 LIVE' : '🟡 SIMULACIÓN'}
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div>
+              <p className="text-xs text-gray-500">Ciclos totales</p>
+              <p className="text-2xl font-bold text-white mt-0.5">{status.total_cycles ?? 0}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Hit rate</p>
+              <p className="text-2xl font-bold text-white mt-0.5">
+                {status.hit_rate_pct != null ? `${status.hit_rate_pct}%` : '—'}
               </p>
             </div>
-          ))}
+            <div>
+              <p className="text-xs text-gray-500">PnL total</p>
+              <p className={`text-2xl font-bold mt-0.5 ${pnlColor(status.total_pnl ?? null)}`}>
+                {status.total_pnl != null
+                  ? `${status.total_pnl >= 0 ? '+' : ''}${status.total_pnl.toFixed(2)} USDC`
+                  : '—'}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Stake actual</p>
+              <p className="text-2xl font-bold text-white mt-0.5">
+                {status.latest_stake != null ? `${status.latest_stake} USDC` : '—'}
+              </p>
+            </div>
+          </div>
+
+          {/* Barra Martingala */}
+          {bar && (
+            <div className="mt-4 space-y-1">
+              <p className="text-xs text-gray-500">
+                Martingala: {status.consecutive_losses ?? 0} pérdida(s) consecutiva(s)
+              </p>
+              <p className="text-xs text-gray-500 font-mono">
+                {status.latest_stake ?? '—'} / {status.max_stake ?? '—'} USDC
+              </p>
+              <div className="w-full bg-gray-800 rounded-full h-1.5">
+                <div
+                  className={`h-1.5 rounded-full transition-all ${bar.color}`}
+                  style={{ width: `${bar.pct}%` }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* ── Barra Martingala ── */}
-      {bar && status && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-3">
-          <div className="flex items-center justify-between mb-1.5">
-            <p className="text-xs text-gray-500">
-              Martingala — {status.consecutive_losses ?? 0} pérdida(s) consecutiva(s)
-            </p>
-            <p className="text-xs text-gray-500 font-mono">
-              {status.latest_stake ?? '—'} / {status.max_stake ?? '—'} USDC
-            </p>
-          </div>
-          <div className="w-full bg-gray-800 rounded-full h-1.5">
-            <div className={`h-1.5 rounded-full transition-all ${bar.color}`} style={{ width: `${bar.pct}%` }} />
-          </div>
-        </div>
-      )}
-
-      {/* ── Ciclo de MAÑANA ── */}
+      {/* ── Ciclo de mañana ── */}
       {tomorrowCycle ? (
         <TomorrowCyclePanel cycle={tomorrowCycle} onRefresh={load} />
       ) : (
@@ -479,123 +456,66 @@ export function BettingEngine() {
         </div>
       )}
 
-      {/* ── Último ciclo cerrado ── */}
-      {status?.latest_date && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-xs text-gray-500 uppercase tracking-wider">Último ciclo</p>
-            <div className="flex items-center gap-2">
-              {status.simulated && (
-                <span className="text-[10px] text-yellow-600 border border-yellow-900 bg-yellow-950/30 rounded px-1.5 py-0.5">
-                  simulado
-                </span>
-              )}
-              <span className={`text-xs px-2 py-0.5 rounded border ${statusBadge(status.latest_status)}`}>
-                {statusLabel(status.latest_status)}
-              </span>
-            </div>
+      {/* ── Historial de ciclos ── */}
+      {cycles.length > 0 && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-800">
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+              Historial de ciclos
+            </p>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <div>
-              <p className="text-xs text-gray-600">Fecha objetivo</p>
-              <p className="font-mono text-white font-medium">
-                {format(parseISO(status.latest_date), 'dd MMM yyyy', { locale: es })}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-gray-600">Token A / B</p>
-              <p className="font-mono text-white font-medium">
-                {status.token_a_temp ?? '—'}°C / {status.token_b_temp ?? '—'}°C
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-gray-600">Temp real</p>
-              <p className={`font-mono font-medium ${status.actual_temp != null ? 'text-white' : 'text-gray-600'}`}>
-                {status.actual_temp != null ? `${status.actual_temp}°C` : 'pendiente'}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-gray-600">P&L ciclo</p>
-              <p className={`font-mono font-bold ${pnlColor(status.latest_pnl)}`}>
-                {status.latest_pnl != null
-                  ? `${status.latest_pnl >= 0 ? '+' : ''}${status.latest_pnl.toFixed(4)} USDC`
-                  : '—'}
-              </p>
-            </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-gray-800">
+                  <th className="px-4 py-2 text-left text-gray-500 font-medium">Fecha</th>
+                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Tokens</th>
+                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Real</th>
+                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Stake</th>
+                  <th className="px-4 py-2 text-right text-gray-500 font-medium">PnL</th>
+                  <th className="px-4 py-2 text-right text-gray-500 font-medium">Estado</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cycles.map(c => (
+                  <tr key={c.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
+                    <td className="px-4 py-2 text-gray-400 font-mono">
+                      {c.target_date}
+                      {c.simulated && (
+                        <span className="ml-1 text-yellow-700 text-[10px]">sim</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2 text-right text-gray-300 font-mono">
+                      {c.token_a_temp != null ? `${c.token_a_temp}°C` : '—'}
+                      {' / '}
+                      {c.token_b_temp != null ? `${c.token_b_temp}°C` : '—'}
+                    </td>
+                    <td className="px-4 py-2 text-right text-gray-300 font-mono">
+                      {formatTemp(c.actual_temp)}
+                    </td>
+                    <td className="px-4 py-2 text-right text-gray-300 font-mono">
+                      {c.stake_usdc} USDC
+                      {c.capped_at_max && (
+                        <span className="ml-1 text-red-500 text-[10px]">MAX</span>
+                      )}
+                    </td>
+                    <td className={`px-4 py-2 text-right font-mono font-semibold ${pnlColor(c.pnl_usdc)}`}>
+                      {c.pnl_usdc != null
+                        ? `${c.pnl_usdc >= 0 ? '+' : ''}${c.pnl_usdc.toFixed(2)}`
+                        : '—'}
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      <span className={`inline-block px-2 py-0.5 rounded border text-[10px] font-medium ${statusBadge(c.status)}`}>
+                        {c.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
-
-      {/* ── Historial de ciclos ── */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-          <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">
-            Historial de ciclos
-          </p>
-          <div className="flex items-center gap-3">
-            {cycles.length > 0 && (
-              <span className="text-xs text-gray-600">{cycles.length} ciclo(s)</span>
-            )}
-          </div>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-gray-800">
-                {['Fecha', 'Stake', '×Mult', 'Tokens', 'Temp Real', 'P&L', 'Estado'].map(h => (
-                  <th key={h} className="px-4 py-2 text-left text-xs text-gray-600 font-normal whitespace-nowrap">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {cycles.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-gray-600 text-xs">
-                    <p className="text-xl mb-1">📋</p>
-                    Sin ciclos registrados todavía
-                  </td>
-                </tr>
-              ) : cycles.map(c => (
-                <tr key={c.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
-                  <td className="px-4 py-2.5 text-gray-300 font-mono text-xs whitespace-nowrap">
-                    {format(parseISO(c.target_date), 'dd/MM/yy')}
-                  </td>
-                  <td className="px-4 py-2.5 text-white font-mono text-xs">
-                    {c.stake_usdc} USDC
-                  </td>
-                  <td className="px-4 py-2.5 text-xs font-mono">
-                    <span className={c.capped_at_max ? 'text-red-400' : 'text-gray-400'}>
-                      ×{c.multiplier}
-                      {c.capped_at_max && <span className="ml-1 text-red-600">⚠</span>}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 text-gray-400 font-mono text-xs whitespace-nowrap">
-                    {c.token_a_temp}°C / {c.token_b_temp}°C
-                  </td>
-                  <td className="px-4 py-2.5 font-mono text-xs">
-                    <span className={c.actual_temp != null ? 'text-white' : 'text-gray-600'}>
-                      {c.actual_temp != null ? `${c.actual_temp}°C` : '—'}
-                    </span>
-                  </td>
-                  <td className={`px-4 py-2.5 font-mono text-xs font-semibold ${pnlColor(c.pnl_usdc)}`}>
-                    {c.pnl_usdc != null
-                      ? `${c.pnl_usdc >= 0 ? '+' : ''}${c.pnl_usdc.toFixed(4)}`
-                      : '—'}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={`text-xs px-2 py-0.5 rounded border ${statusBadge(c.status)}`}>
-                      {statusLabel(c.status)}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
     </div>
   )
 }
