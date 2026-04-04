@@ -77,13 +77,24 @@ export class ClobClient {
   }
 
   // ── ethersSigner ─────────────────────────────────────────────────────────
-  // El SDK comprueba typeof signer._signTypedData === "function".
-  // Ethers v6 usa signTypedData() (sin guión bajo) — adaptamos la interfaz.
+  //
+  // FIX ethers v6 / clob-client (ethers v5) incompatibilidad:
+  //
+  // El SDK llama a _signTypedData(domain, types, value) donde `types` INCLUYE
+  // la entrada "EIP712Domain" (comportamiento de ethers v5).
+  // Ethers v6's signTypedData() rechaza esa entrada y produce una firma diferente
+  // → el servidor devuelve "invalid signature".
+  //
+  // Solución: eliminar EIP712Domain del objeto types antes de llamar a ethers v6.
 
   private get ethersSigner() {
     return {
-      _signTypedData: (domain: any, types: any, value: any) =>
-        this.wallet.signTypedData(domain, types, value),
+      _signTypedData: (domain: any, types: any, value: any) => {
+        // Ethers v6 no acepta EIP712Domain dentro del mapa de tipos.
+        // El SDK (compilado para v5) siempre lo inyecta → lo filtramos aquí.
+        const { EIP712Domain: _removed, ...filteredTypes } = types
+        return this.wallet.signTypedData(domain, filteredTypes, value)
+      },
       getAddress: () => Promise.resolve(this.wallet.address),
     }
   }
@@ -119,30 +130,32 @@ export class ClobClient {
   }
 
   // ── buildPolyClient ───────────────────────────────────────────────────────
-  // Pasamos la private key como string directamente, igual que py_clob_client
-  // (key=private_key). El signer adapter de ethers v6 no es compatible con
-  // cómo el SDK firma internamente (usa ethers v5 internamente).
+  //
+  // FIX signatureType: cambiado de 1 (POLY_PROXY) a 0 (EOA).
+  //
+  // signatureType=1 (POLY_PROXY) asume que existe un contrato proxy desplegado
+  // en Polygon asociado al EOA. Si estás operando directamente con una private key
+  // sin proxy, el servidor rechaza la firma porque espera la del proxy, no la del EOA.
+  //
+  // signatureType=0 (EOA) firma directamente con la private key → correcto para
+  // cuentas que no han pasado por el onboarding de proxy de Polymarket.
 
   private async buildPolyClient(): Promise<PolyClobClient> {
     const creds = await this.getCredentials()
 
-    // POLY_PROXY (signatureType=1): funder = EOA (la dirección que controla el proxy).
-    // El CLOB con tipo 1 busca automáticamente el proxy wallet asociado al EOA
-    // para verificar el balance — NO hay que pasar la dirección del proxy como funder.
-    // Python: signature_type=1, funder=cfg["polymarket"]["funder"] = EOA address.
-    console.log(`[CLOB] Funder: ${this.wallet.address} | signatureType: 1 (POLY_PROXY)`)
+    console.log(`[CLOB] Funder: ${this.wallet.address} | signatureType: 0 (EOA)`)
 
     return new PolyClobClient(
       CLOB_HOST,
       Chain.POLYGON,
-      this.ethersSigner,        // objeto con _signTypedData — requerido por el SDK
+      this.ethersSigner,
       {
         key:        creds.apiKey,
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
       },
-      1 as any,                 // POLY_PROXY: el CLOB busca el proxy del EOA para el balance
-      this.wallet.address,      // funder = EOA (no el proxy) — igual que Python
+      0 as any,              // EOA — firma directa con la private key
+      this.wallet.address,
     )
   }
 
@@ -219,8 +232,6 @@ export class ClobClient {
   }
 
   // ── getBalance ────────────────────────────────────────────────────────────
-  // FIX: pasar { assetType: AssetType.COLLATERAL } para leer el saldo USDC.
-  // Sin este parámetro getBalanceAllowance() devuelve 0 aunque haya fondos.
 
   async getBalance(): Promise<number> {
     const client = await this.buildPolyClient()
