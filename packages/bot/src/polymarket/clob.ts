@@ -59,22 +59,21 @@ export class ClobClient {
   private memCache: L2Credentials | null = null  // caché en memoria (dentro de un run)
 
   constructor(
-    private walletAddress: string,  // POLYMARKET_API_KEY env var (dirección pública)
-    private privateKey: string      // POLYMARKET_PRIVATE_KEY env var
+    private walletAddress: string,
+    private privateKey: string
   ) {
     const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`
     this.wallet = new ethers.Wallet(normalizedKey)
 
-    // ── Debug: verificar que private key y address coinciden ─────────────────
     console.log('[CLOB] Wallet derivada de POLYMARKET_PRIVATE_KEY:', this.wallet.address)
     console.log('[CLOB] POLYMARKET_API_KEY (walletAddress param):  ', walletAddress)
     if (this.wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
-      console.error('[CLOB] ⚠️  MISMATCH — las dos addresses no coinciden, esto causará 401')
+      console.error('[CLOB] ⚠️  MISMATCH — las addresses no coinciden, esto causará 401')
     } else {
       console.log('[CLOB] ✅ Addresses coinciden')
     }
 
-    // ── Prioridad 0: credenciales L2 inyectadas por env vars ─────────────────
+    // Prioridad 0: credenciales L2 inyectadas por env vars
     const envKey        = process.env.CLOB_API_KEY
     const envSecret     = process.env.CLOB_API_SECRET
     const envPassphrase = process.env.CLOB_API_PASSPHRASE
@@ -84,11 +83,8 @@ export class ClobClient {
       console.log(`[CLOB]   CLOB_API_SECRET      = ${envSecret.substring(0, 8)}…`)
       console.log(`[CLOB]   CLOB_API_PASSPHRASE  = ${envPassphrase.substring(0, 8)}…`)
       this.memCache = {
-        apiKey:        envKey,
-        apiSecret:     envSecret,
-        apiPassphrase: envPassphrase,
-        walletAddress: this.wallet.address,
-        derivedAt:     'env-var',
+        apiKey: envKey, apiSecret: envSecret, apiPassphrase: envPassphrase,
+        walletAddress: this.wallet.address, derivedAt: 'env-var',
       }
     }
   }
@@ -97,20 +93,13 @@ export class ClobClient {
   // Prioridad: 1) caché en memoria → 2) Supabase → 3) derivar desde Polymarket
 
   private async getCredentials(): Promise<L2Credentials> {
-    // 0. Variables de entorno (máxima prioridad — bypass total)
-    const envKey        = process.env.CLOB_API_KEY
-    const envSecret     = process.env.CLOB_API_SECRET
+    // 0. Env vars (máxima prioridad)
+    const envKey = process.env.CLOB_API_KEY
+    const envSecret = process.env.CLOB_API_SECRET
     const envPassphrase = process.env.CLOB_API_PASSPHRASE
     if (envKey && envSecret && envPassphrase) {
-      const envCreds: L2Credentials = {
-        apiKey:        envKey,
-        apiSecret:     envSecret,
-        apiPassphrase: envPassphrase,
-        walletAddress: this.wallet.address,
-        derivedAt:     'env-var',
-      }
-      this.memCache = envCreds
-      return envCreds
+      return { apiKey: envKey, apiSecret: envSecret, apiPassphrase: envPassphrase,
+               walletAddress: this.wallet.address, derivedAt: 'env-var' }
     }
 
     // 1. Caché en memoria (evita una query a Supabase por cada orden en el mismo run)
@@ -243,11 +232,10 @@ export class ClobClient {
       const status = err?.response?.status
       const body   = err?.response?.data
 
-      // 400 + "already exists" o 405 → la key ya fue derivada, recuperarla con GET
+      // 400+"already exists" o 405 → key ya derivada, recuperar con GET
       const keyAlreadyExists =
         (status === 400 && JSON.stringify(body ?? '').toLowerCase().includes('already exists')) ||
         status === 405
-
       if (keyAlreadyExists) {
         console.log(`[CLOB] API key ya existía en Polymarket (HTTP ${status}) — recuperando con GET…`)
         const getRes = await axios.get(
@@ -280,8 +268,7 @@ export class ClobClient {
   }
 
   // ── buildAuthHeaders ──────────────────────────────────────────────────────
-  // Genera los headers L2 que Polymarket exige en cada request autenticado.
-  // La firma es HMAC-SHA256(base64decode(secret), timestamp+METHOD+path+body).
+  // HMAC-SHA256(base64decode(secret), timestamp+METHOD+path+body)
   // Ref: py-clob-client → headers.py → create_level_2_headers
 
   private buildAuthHeaders(
@@ -294,8 +281,6 @@ export class ClobClient {
     const msg       = timestamp + method.toUpperCase() + requestPath + (body ?? '')
     const secret    = Buffer.from(creds.apiSecret, 'base64')
     const signature = crypto.createHmac('sha256', secret).update(msg).digest('base64')
-
-    console.log(`[CLOB] Auth headers — method: ${method.toUpperCase()} ${requestPath}, ts: ${timestamp}, sig: ${signature.substring(0, 12)}…`)
 
     return {
       'Content-Type':    'application/json',
@@ -348,17 +333,20 @@ export class ClobClient {
     const body      = JSON.stringify(orderData)
     const headers   = this.buildAuthHeaders(creds, 'POST', '/order', body)
 
-    const res = await axios.post(
-      `${CLOB_BASE}/order`,
-      orderData,
-      { headers, timeout: 15_000 }
-    )
+    console.log('[CLOB] Enviando orden:', JSON.stringify(orderData, null, 2))
 
-    return {
-      orderId:    res.data.orderID    ?? res.data.orderId ?? 'unknown',
-      status:     res.data.status     ?? 'open',
-      filledSize: res.data.filledSize ?? 0,
-      price:      res.data.price      ?? params.price,
+    try {
+      const res = await axios.post(`${CLOB_BASE}/order`, orderData, { headers, timeout: 15_000 })
+      return {
+        orderId:    res.data.orderID    ?? res.data.orderId ?? 'unknown',
+        status:     res.data.status     ?? 'open',
+        filledSize: res.data.filledSize ?? 0,
+        price:      res.data.price      ?? params.price,
+      }
+    } catch (err: any) {
+      // Log completo del body de error para diagnóstico
+      console.error('[CLOB] Error POST /order — response body:', JSON.stringify(err?.response?.data))
+      throw err
     }
   }
 
@@ -389,11 +377,13 @@ export class ClobClient {
       signatureType: 0,  // EOA (Externally Owned Account)
     }
 
-    // Dominio EIP-712 de Polymarket CLOB en Polygon mainnet
+    // Dominio EIP-712 de Polymarket CTF Exchange en Polygon mainnet
+    // verifyingContract: CTF Exchange — https://polygonscan.com/address/0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
     const domain = {
-      name:    'ClobAuthDomain',
-      version: '1',
-      chainId: 137,
+      name:              'CTF Exchange',
+      version:           '1',
+      chainId:           137,
+      verifyingContract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
     }
 
     const types = {
@@ -408,8 +398,8 @@ export class ClobClient {
         { name: 'expiration',    type: 'uint256' },
         { name: 'nonce',         type: 'uint256' },
         { name: 'feeRateBps',    type: 'uint256' },
-        { name: 'side',          type: 'uint8'   },
-        { name: 'signatureType', type: 'uint8'   },
+        { name: 'side',          type: 'uint256' },
+        { name: 'signatureType', type: 'uint256' },
       ],
     }
 
