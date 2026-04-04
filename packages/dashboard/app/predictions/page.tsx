@@ -14,31 +14,31 @@ function getSupabase() {
   )
 }
 
+// FIX: leer bias directamente de bot_config (igual que page.tsx),
+// no de bot_events que usa campos que no existen (category, metadata, created_at).
 async function getWeightsAndBias() {
   const supabase = getSupabase()
 
-  const [{ data: sources }, { data: lastEvent }] = await Promise.all([
+  const [{ data: sources }, { data: biasConfig }] = await Promise.all([
     supabase
       .from('weather_sources')
       .select('slug, name, weight, updated_at')
       .eq('active', true)
       .order('weight', { ascending: false }),
     supabase
-      .from('bot_events')
-      .select('metadata, created_at')
-      .eq('category', 'weight_update')
-      .order('created_at', { ascending: false })
-      .limit(1)
+      .from('bot_config')
+      .select('value, updated_at')
+      .eq('key', 'prediction_bias_n')
       .maybeSingle(),
   ])
 
-  const meta  = lastEvent?.metadata as Record<string, unknown> | null
-  const biasN = (meta?.biasN as number | undefined) ?? null
+  const rawBias = biasConfig?.value
+  const biasN   = rawBias !== null && rawBias !== undefined ? Number(rawBias) : null
 
   return {
     weights:   sources ?? [],
-    biasN,
-    updatedAt: lastEvent?.created_at ?? null,
+    biasN:     biasN !== null && !isNaN(biasN) ? biasN : null,
+    updatedAt: biasConfig?.updated_at ?? null,
   }
 }
 
