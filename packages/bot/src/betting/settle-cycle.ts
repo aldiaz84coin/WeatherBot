@@ -6,12 +6,15 @@
 //   1. Buscar betting_cycle abierto para HOY
 //   2. Consultar temperatura real en Polymarket
 //   3. Determinar si ganamos (token_a_temp o token_b_temp == round(actualTemp))
-//   4. Calcular P&L y actualizar betting_cycle + results
-//   5. Aplicar Martingala:
+//   4. Calcular P&L
+//   5. Actualizar betting_cycle + tabla results
+//   6. Loggear resultado en bot_events
+//   7. Aplicar Martingala:
 //      - Win  → reset stake al base (multiplicador = 1)
 //      - Loss → doblar stake (min(base * mult * 2, max))
-//   6. Optimizar pesos de fuentes con el histórico actualizado
-//   7. Loggear todo en bot_events
+//
+// NOTA: La optimización de pesos ya NO se ejecuta aquí.
+//       Los pesos se gestionan exclusivamente desde el AI Optimizer del dashboard.
 // ──────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config'
@@ -20,7 +23,6 @@ import { supabase } from '../db/supabase'
 import { MarketDiscovery } from '../polymarket/market-discovery'
 import { BotEventLogger } from './logger'
 import { getStakeConfig, resetStake, doubleStake } from './config'
-import { optimizeSourceWeights } from './weight-optimizer'
 
 const logger = new BotEventLogger('SETTLE')
 
@@ -71,8 +73,8 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
   }
 
   // ── 3. ¿Ganamos? ──────────────────────────────────────────────────────────
-  const roundedTemp = Math.round(actualTemp)
-  const won         = roundedTemp === cycle.token_a_temp || roundedTemp === cycle.token_b_temp
+  const roundedTemp  = Math.round(actualTemp)
+  const won          = roundedTemp === cycle.token_a_temp || roundedTemp === cycle.token_b_temp
   const winningToken = won
     ? (roundedTemp === cycle.token_a_temp ? cycle.token_a_temp : cycle.token_b_temp)
     : null
@@ -82,7 +84,6 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
   // Si perdemos: neto = -stake
   let pnl: number
   if (won && cycle.shares) {
-    // El share ganador vale 1 USDC cada uno
     const gross = parseFloat((cycle.shares * 1).toFixed(4))
     pnl = parseFloat((gross - cycle.stake_usdc).toFixed(4))
   } else {
@@ -111,7 +112,7 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
                      : winningToken === cycle.token_b_temp ? 'b'
                      : null
 
-    await supabase.from('results').upsert({
+    const { error: resultsErr } = await supabase.from('results').upsert({
       prediction_id:    cycle.prediction_id,
       target_date:      today,
       actual_temp:      actualTemp,
@@ -121,6 +122,16 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
       cost_usdc:        cycle.stake_usdc,
       source:           'polymarket',
     }, { onConflict: 'prediction_id' })
+
+    if (resultsErr) {
+      await logger.error(`Error upsert results: ${resultsErr.message}`, resultsErr, cycle.id)
+    }
+
+    // Marcar predicción como liquidada
+    await supabase
+      .from('predictions')
+      .update({ settled: true, settled_at: new Date().toISOString() })
+      .eq('id', cycle.prediction_id)
   }
 
   // ── 7. Loggear resultado ──────────────────────────────────────────────────
@@ -138,7 +149,6 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
   const currentStake = await getStakeConfig()
 
   if (won) {
-    // Reset al stake base
     await resetStake()
     await logger.log('success', 'stake_reset',
       `Stake reseteado → ${currentStake.baseStake} USDC (mult × 1)`,
@@ -146,7 +156,6 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
       cycle.id
     )
   } else {
-    // Doblar stake
     const next = await doubleStake(currentStake)
 
     if (next.cappedAtMax) {
@@ -163,10 +172,6 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
       )
     }
   }
-
-  // ── 9. Optimizar pesos de fuentes ─────────────────────────────────────────
-  // Siempre que hay un resultado nuevo, recalibramos los pesos del ensemble.
-  await optimizeSourceWeights(cycle.id)
 }
 
 // ─── Entrypoint directo ───────────────────────────────────────────────────────
