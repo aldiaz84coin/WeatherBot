@@ -160,6 +160,26 @@ export class ClobClient {
     }
 
     try {
+      // ── Verificar balance y allowance antes de firmar ───────────────────────
+      const balInfo = await client.getBalanceAllowance({ asset_type: 1 as any }) // USDC
+      const balance   = parseFloat((balInfo as any)?.balance   ?? '0')
+      const allowance = parseFloat((balInfo as any)?.allowance ?? '0')
+      console.log(`[CLOB] Balance USDC: ${balance} | Allowance: ${allowance} | Necesario: ${params.size}`)
+
+      if (balance < params.size) {
+        throw new Error(
+          `[CLOB] Balance insuficiente: tienes ${balance} USDC, necesitas ${params.size} USDC. ` +
+          `Fondea la wallet ${this.wallet.address} en Polygon.`
+        )
+      }
+
+      if (allowance < params.size) {
+        console.log('[CLOB] Allowance insuficiente — aprobando CLOB contract para gastar USDC…')
+        await client.updateBalanceAllowance({ asset_type: 1 as any })
+        console.log('[CLOB] ✅ Allowance actualizada')
+      }
+
+      // ── Crear y enviar orden ────────────────────────────────────────────────
       const signedOrder = await client.createOrder(
         { tokenID: params.tokenId, price: params.price, size: sizeInShares, side: Side.BUY },
         { negRisk }
@@ -168,6 +188,11 @@ export class ClobClient {
       console.log('[CLOB] Orden firmada, enviando…')
       const res = await client.postOrder(signedOrder, OrderType.GTC)
       console.log('[CLOB] Respuesta:', JSON.stringify(res))
+
+      // El SDK no siempre lanza excepción — detectar errores en el body
+      if (res?.error || (typeof res?.status === 'number' && res.status >= 400)) {
+        throw new Error(`[CLOB] Orden rechazada: ${JSON.stringify(res)}`)
+      }
 
       const orderId = res?.orderID ?? res?.orderId ?? res?.hash ?? 'unknown'
       return {
@@ -179,7 +204,7 @@ export class ClobClient {
     } catch (err: any) {
       const status = err?.response?.status
       const body   = err?.response?.data
-      console.error(`[CLOB] Error placeOrder (HTTP ${status ?? '?'}):`, JSON.stringify(body ?? err?.message))
+      console.error(`[CLOB] Error placeOrder:`, body ? JSON.stringify(body) : err?.message)
       throw err
     }
   }
