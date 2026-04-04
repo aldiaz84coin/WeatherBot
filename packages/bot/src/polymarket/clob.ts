@@ -64,12 +64,55 @@ export class ClobClient {
   ) {
     const normalizedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`
     this.wallet = new ethers.Wallet(normalizedKey)
+
+    // ── Debug: verificar que private key y address coinciden ─────────────────
+    console.log('[CLOB] Wallet derivada de POLYMARKET_PRIVATE_KEY:', this.wallet.address)
+    console.log('[CLOB] POLYMARKET_API_KEY (walletAddress param):  ', walletAddress)
+    if (this.wallet.address.toLowerCase() !== walletAddress.toLowerCase()) {
+      console.error('[CLOB] ⚠️  MISMATCH — las dos addresses no coinciden, esto causará 401')
+    } else {
+      console.log('[CLOB] ✅ Addresses coinciden')
+    }
+
+    // ── Prioridad 0: credenciales L2 inyectadas por env vars ─────────────────
+    const envKey        = process.env.CLOB_API_KEY
+    const envSecret     = process.env.CLOB_API_SECRET
+    const envPassphrase = process.env.CLOB_API_PASSPHRASE
+    if (envKey && envSecret && envPassphrase) {
+      console.log('[CLOB] 🔑 Credenciales L2 cargadas desde ENV vars:')
+      console.log(`[CLOB]   CLOB_API_KEY        = ${envKey.substring(0, 8)}…`)
+      console.log(`[CLOB]   CLOB_API_SECRET      = ${envSecret.substring(0, 8)}…`)
+      console.log(`[CLOB]   CLOB_API_PASSPHRASE  = ${envPassphrase.substring(0, 8)}…`)
+      this.memCache = {
+        apiKey:        envKey,
+        apiSecret:     envSecret,
+        apiPassphrase: envPassphrase,
+        walletAddress: this.wallet.address,
+        derivedAt:     'env-var',
+      }
+    }
   }
 
   // ── getCredentials ────────────────────────────────────────────────────────
   // Prioridad: 1) caché en memoria → 2) Supabase → 3) derivar desde Polymarket
 
   private async getCredentials(): Promise<L2Credentials> {
+    // 0. Variables de entorno (máxima prioridad — bypass total)
+    const envKey        = process.env.CLOB_API_KEY
+    const envSecret     = process.env.CLOB_API_SECRET
+    const envPassphrase = process.env.CLOB_API_PASSPHRASE
+    if (envKey && envSecret && envPassphrase) {
+      const envCreds: L2Credentials = {
+        apiKey:        envKey,
+        apiSecret:     envSecret,
+        apiPassphrase: envPassphrase,
+        walletAddress: this.wallet.address,
+        derivedAt:     'env-var',
+      }
+      this.memCache = envCreds
+      return envCreds
+    }
+
     // 1. Caché en memoria (evita una query a Supabase por cada orden en el mismo run)
     if (this.memCache && this.memCache.walletAddress === this.wallet.address) {
       return this.memCache
@@ -239,7 +282,7 @@ export class ClobClient {
   // ── buildAuthHeaders ──────────────────────────────────────────────────────
   // Genera los headers L2 que Polymarket exige en cada request autenticado.
   // La firma es HMAC-SHA256(base64decode(secret), timestamp+METHOD+path+body).
-  // Ref: https://docs.polymarket.com/#level-2-authentication
+  // Ref: py-clob-client → headers.py → create_level_2_headers
 
   private buildAuthHeaders(
     creds: L2Credentials,
@@ -248,11 +291,11 @@ export class ClobClient {
     body?: string,
   ): Record<string, string> {
     const timestamp = Math.floor(Date.now() / 1000).toString()
-
-    // Mensaje: timestamp + METHOD + /path + body (vacío si GET)
     const msg       = timestamp + method.toUpperCase() + requestPath + (body ?? '')
     const secret    = Buffer.from(creds.apiSecret, 'base64')
     const signature = crypto.createHmac('sha256', secret).update(msg).digest('base64')
+
+    console.log(`[CLOB] Auth headers — method: ${method.toUpperCase()} ${requestPath}, ts: ${timestamp}, sig: ${signature.substring(0, 12)}…`)
 
     return {
       'Content-Type':    'application/json',
