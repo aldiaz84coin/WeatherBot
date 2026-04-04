@@ -135,7 +135,7 @@ export class ClobClient {
         secret:     creds.apiSecret,
         passphrase: creds.apiPassphrase,
       },
-      0 as any,                 // signatureType 0 = EOA
+      1 as any,                 // POLY_PROXY: fondos depositados via Polymarket web
       this.wallet.address,      // funder — wallet con el USDC
     )
   }
@@ -191,6 +191,11 @@ export class ClobClient {
       console.log('[CLOB] Orden firmada, enviando…')
       const res = await client.postOrder(signedOrder, OrderType.GTC)
       console.log('[CLOB] Respuesta:', JSON.stringify(res))
+
+      // El SDK no lanza error en respuestas 4xx — detectarlas manualmente
+      if (res?.error || (typeof res?.status === 'number' && res.status >= 400)) {
+        throw new Error(`[CLOB] Rechazada por el servidor: ${res?.error ?? JSON.stringify(res)}`)
+      }
 
       const orderId = res?.orderID ?? res?.orderId ?? res?.hash ?? 'unknown'
       return {
