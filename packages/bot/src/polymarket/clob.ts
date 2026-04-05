@@ -498,29 +498,31 @@ export class ClobClient {
     console.log('[CLOB-DIAG] ════════════════════════════════════════════')
   }
 
-  // Fetch info de un mercado específico desde el CLOB REST para ver neg_risk
+  // Fetch info de un mercado específico desde la Gamma API para ver neg_risk.
+  // Usa gamma-api.polymarket.com (no clob.polymarket.com) con el param clob_token_ids.
   async logMarketInfo(tokenId: string): Promise<void> {
     try {
       const res = await fetch(
-        `${CLOB_HOST}/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
+        `https://gamma-api.polymarket.com/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
         { signal: AbortSignal.timeout(8_000) }
       )
       const data: any = await res.json()
       const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
       const m = markets[0]
       if (!m) {
-        console.log(`[CLOB-MARKET] No se encontró mercado para token ${tokenId.substring(0, 16)}…`)
+        console.log(`[CLOB-MARKET] ⚠️  No se encontró mercado en Gamma para token ${tokenId.substring(0, 16)}…`)
         return
       }
       console.log(`[CLOB-MARKET] token=${tokenId.substring(0, 16)}…`)
-      console.log(`[CLOB-MARKET]   question:        ${m.question ?? '?'}`)
-      console.log(`[CLOB-MARKET]   neg_risk:        ${m.neg_risk}`)
-      console.log(`[CLOB-MARKET]   tick_size:       ${m.tick_size ?? m.minimum_tick_size ?? '?'}`)
-      console.log(`[CLOB-MARKET]   minimum_order_size: ${m.minimum_order_size ?? '?'}`)
-      console.log(`[CLOB-MARKET]   accepting_orders: ${m.accepting_orders}`)
-      console.log(`[CLOB-MARKET]   active:          ${m.active}`)
-      console.log(`[CLOB-MARKET]   closed:          ${m.closed}`)
-      console.log(`[CLOB-MARKET]   condition_id:    ${m.condition_id ?? '?'}`)
+      console.log(`[CLOB-MARKET]   question:            ${m.question ?? '?'}`)
+      console.log(`[CLOB-MARKET]   slug:                ${m.slug ?? '?'}`)
+      console.log(`[CLOB-MARKET]   neg_risk / negRisk:  ${m.neg_risk ?? m.negRisk}`)
+      console.log(`[CLOB-MARKET]   tickSize:            ${m.orderPriceMinTickSize ?? m.tick_size ?? '?'}`)
+      console.log(`[CLOB-MARKET]   minOrderSize:        ${m.orderMinSize ?? m.minimum_order_size ?? '?'}`)
+      console.log(`[CLOB-MARKET]   acceptingOrders:     ${m.acceptingOrders ?? m.accepting_orders}`)
+      console.log(`[CLOB-MARKET]   active:              ${m.active}`)
+      console.log(`[CLOB-MARKET]   closed:              ${m.closed}`)
+      console.log(`[CLOB-MARKET]   conditionId:         ${m.conditionId ?? m.condition_id ?? '?'}`)
     } catch (err: any) {
       console.log(`[CLOB-MARKET] Error: ${err?.message}`)
     }
