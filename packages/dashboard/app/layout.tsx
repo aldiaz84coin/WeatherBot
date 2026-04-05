@@ -25,6 +25,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <a href="/optimizer"   className="text-sm text-gray-400 hover:text-white transition-colors">
             🤖 Optimizador IA
           </a>
+            <a href="/research-markets" className="text-sm text-gray-400 hover:text-white transition-colors">
+            🔬 Investigación
+          </a>
           <a href="/config"      className="text-sm text-gray-400 hover:text-white transition-colors">
             ⚙️ Configuración
           </a>
