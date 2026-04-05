@@ -63,13 +63,14 @@ export async function POST() {
     for (const k of RESEARCH_SOURCES) weights[k] = 0.2
   }
 
-  // ── 2. Leer bias_n (READ-ONLY) ─────────────────────────────────────────────
+ // ── 2. Leer bias_n (READ-ONLY) ─────────────────────────────────────────────
+  // bot_config es key/value: la clave es 'prediction_bias_n' y value es jsonb numérico
   const { data: cfg } = await supabase
     .from('bot_config')
-    .select('bias_n')
-    .limit(1)
+    .select('value')
+    .eq('key', 'prediction_bias_n')
     .maybeSingle()
-  const biasN: number = cfg?.bias_n ?? 0
+  const biasN: number = cfg?.value != null ? Number(cfg.value) : 0
 
   // ── 3. Fetch API keys ──────────────────────────────────────────────────────
   const keys = {
