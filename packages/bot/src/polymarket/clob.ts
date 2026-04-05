@@ -235,21 +235,30 @@ export class ClobClient {
       console.log(`[CLOB] Precio redondeado al tick: ${params.price} → ${roundedPrice} (tickSize=${tickSize})`)
     }
 
-    // Para que makerAmount/takerAmount == roundedPrice EXACTAMENTE,
-    // expresamos el ratio como priceInTicks/ticksPerUnit y forzamos
-    // makerAmount como múltiplo de priceInTicks.
-    //   roundedPrice = priceInTicks / ticksPerUnit = P/T
-    //   → makerAmount/takerAmount = P/T
-    //   → makerAmount = k * P, takerAmount = k * T
-    const desiredMaker = toMicroUsdc(params.size)
-    const kUnits = desiredMaker / BigInt(priceInTicks)       // división entera
-    const makerAmount = kUnits * BigInt(priceInTicks)
-    const takerAmount = kUnits * BigInt(ticksPerUnit)
+    // Servidor exige:
+    //   - makerAmount (USDC micros): max 4 decimales → divisible por 100
+    //   - takerAmount (shares micros): max 2 decimales → divisible por 10000
+    //
+    // Estrategia: cuantizar shares a centésimas (2 decimales) y derivar
+    // makerAmount del priceInTicks. Esto garantiza:
+    //   ratio = makerAmount / takerAmount = priceInTicks / ticksPerUnit = roundedPrice EXACTO
+    //   takerAmount = sharesCentesimas * 10000  (múltiplo de 10000)
+    //   makerAmount = priceInTicks * sharesCentesimas * 100  (múltiplo de 100)
+    //
+    // Redondeamos shares HACIA ABAJO para no gastar más de lo pedido.
+    const targetShares      = params.size / roundedPrice
+    const sharesCentesimas  = Math.floor(targetShares * 100)   // 9.4269 → 942
+    if (sharesCentesimas <= 0) {
+      throw new Error(`[CLOB] Shares insuficientes para orden: size=${params.size}, price=${roundedPrice}`)
+    }
+    const takerAmount = BigInt(sharesCentesimas) * 10000n
+    const makerAmount = BigInt(priceInTicks) * BigInt(sharesCentesimas) * 100n
+    const actualUsdc  = Number(makerAmount) / 1_000_000
     const sharesFloat = Number(takerAmount) / 1_000_000
 
     console.log(
-      `[CLOB] Colocando orden: price=${roundedPrice} | usdc=${Number(makerAmount) / 1_000_000} | ` +
-      `shares=${sharesFloat.toFixed(4)} | negRisk=${negRisk} | feeRateBps=${feeRateBpsInt}`
+      `[CLOB] Colocando orden: price=${roundedPrice} | usdc=${actualUsdc} | ` +
+      `shares=${sharesFloat.toFixed(2)} | negRisk=${negRisk} | feeRateBps=${feeRateBpsInt}`
     )
     console.log(`[CLOB] makerAmount=${makerAmount} | takerAmount=${takerAmount} | ratio=${Number(makerAmount)/Number(takerAmount)}`)
 
