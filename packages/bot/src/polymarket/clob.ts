@@ -290,7 +290,6 @@ export class ClobClient {
     const l2Headers = buildL2Headers(creds, 'POST', path, body, timestamp)
 
     console.log('[CLOB] owner:  ' + ownerAddress + ' | EOA: ' + this.wallet.address)
-    console.log('[CLOB] domain: ' + JSON.stringify({ name: domain.name, verifyingContract: exchange }))
     console.log('[CLOB] body:   ' + body)
     console.log('[CLOB] Enviando orden al CLOB REST API…')
     let res: Response
@@ -351,76 +350,48 @@ export class ClobClient {
   }
 
   // ── resolveOwnerAddress ──────────────────────────────────────────────────
-  // El 'owner' en POST /order es la PROXY WALLET, no el EOA.
-  // Python equivalente: cfg["polymarket"]["funder"] = proxy wallet address.
-  // Prioridad:
-  //   1. POLYMARKET_FUNDER env var (debe ser la proxy, NO el EOA)
-  //   2. POST /auth/api-key con L1 auth → campo 'funder' en la respuesta
-  //   3. EOA como fallback (va a fallar, pero loguea todo)
+  // Proxy wallet = POLYMARKET_FUNDER env var (o descubierto via L1 discovery).
 
   private ownerAddressCache: string | null = null
 
   async resolveOwnerAddress(creds: L2Credentials): Promise<string> {
     if (process.env.POLYMARKET_FUNDER) {
       const addr = process.env.POLYMARKET_FUNDER.trim()
-      if (addr.toLowerCase() === this.wallet.address.toLowerCase()) {
-        console.warn('[CLOB] ⚠️  POLYMARKET_FUNDER == EOA — incorrecto, la proxy wallet es diferente.')
-        // Caer al discovery
-      } else {
+      if (addr.toLowerCase() !== this.wallet.address.toLowerCase()) {
         console.log(`[CLOB] owner → POLYMARKET_FUNDER: ${addr}`)
         return addr
       }
+      console.warn('[CLOB] ⚠️  POLYMARKET_FUNDER == EOA — usando EOA como fallback.')
     }
     if (this.ownerAddressCache) return this.ownerAddressCache
-
-    // Discovery: mismo endpoint que deriveCredentials — la respuesta incluye 'funder'
     try {
-      console.log('[CLOB] Descubriendo proxy wallet via L1 auth…')
       const timestamp = Math.floor(Date.now() / 1000)
       const authDomain = { name: 'ClobAuthDomain', version: '1', chainId: CHAIN_ID }
-      const authTypes  = {
-        ClobAuth: [
-          { name: 'address',   type: 'address' },
-          { name: 'timestamp', type: 'string'  },
-          { name: 'nonce',     type: 'uint256' },
-          { name: 'message',   type: 'string'  },
-        ],
-      }
+      const authTypes  = { ClobAuth: [
+        { name: 'address', type: 'address' }, { name: 'timestamp', type: 'string' },
+        { name: 'nonce', type: 'uint256' }, { name: 'message', type: 'string' },
+      ]}
       const sig = await this.wallet.signTypedData(authDomain, authTypes, {
-        address:   this.wallet.address,
-        timestamp: String(timestamp),
-        nonce:     0,
-        message:   'This message attests that I have read and agree to the terms of service.',
+        address: this.wallet.address, timestamp: String(timestamp), nonce: 0,
+        message: 'This message attests that I have read and agree to the terms of service.',
       })
       const res = await fetch(`${CLOB_HOST}/auth/api-key`, {
-        method:  'POST',
-        headers: {
-          'Content-Type':   'application/json',
-          'POLY-ADDRESS':   this.wallet.address,
-          'POLY-SIGNATURE': sig,
-          'POLY-TIMESTAMP': String(timestamp),
-          'POLY-NONCE':     '0',
-        },
-        body:   '{}',
-        signal: AbortSignal.timeout(10_000),
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'POLY-ADDRESS': this.wallet.address,
+          'POLY-SIGNATURE': sig, 'POLY-TIMESTAMP': String(timestamp), 'POLY-NONCE': '0' },
+        body: '{}', signal: AbortSignal.timeout(10_000),
       })
       const data: any = await res.json()
-      console.log('[CLOB] L1 /auth/api-key raw:', JSON.stringify(data))
-
-      const discovered = data?.funder ?? data?.proxyWallet ?? data?.proxy_wallet ?? null
+      console.log('[CLOB] L1 discovery raw:', JSON.stringify(data))
+      const discovered = data?.funder ?? data?.proxyWallet ?? null
       if (discovered && ethers.isAddress(discovered)
           && discovered.toLowerCase() !== this.wallet.address.toLowerCase()) {
-        console.log(`[CLOB] ✅ Proxy wallet: ${discovered}`)
-        console.log(`[CLOB]    💡 Añade en Railway: POLYMARKET_FUNDER=${discovered}`)
+        console.log(`[CLOB] ✅ Proxy wallet: ${discovered} → añade POLYMARKET_FUNDER=${discovered} en Railway`)
         this.ownerAddressCache = discovered
         return discovered
       }
-      console.warn('[CLOB] Campos recibidos:', Object.keys(data ?? {}))
-    } catch (err: any) {
-      console.warn('[CLOB] L1 discovery fallida:', err?.message)
-    }
-    console.warn('[CLOB] ⚠️  Usando EOA como owner — casi seguro que fallará.')
-    console.warn('[CLOB]    Busca cfg["polymarket"]["funder"] en el bot Python y añádelo como POLYMARKET_FUNDER.')
+    } catch (err: any) { console.warn('[CLOB] L1 discovery fallida:', err?.message) }
+    console.warn('[CLOB] ⚠️  Usando EOA como owner.')
     return this.wallet.address
   }
 
@@ -516,14 +487,21 @@ export class ClobClient {
   // Igual que ClobClient.create_or_derive_api_key() en Python
 
   private async deriveCredentials(): Promise<L2Credentials> {
-    const timestamp = Math.floor(Date.now() / 1000)
-    const message   = `${timestamp}GET/auth/api-key`
+    // En POLY_PROXY (signature_type=1), el POLY-ADDRESS para L1 auth debe ser
+    // la PROXY WALLET, no el EOA. py-clob-client: self.get_address() = self.funder.
+    // Si POLYMARKET_FUNDER está configurado, usarlo; si no, usar EOA como fallback.
+    const l1Address = (process.env.POLYMARKET_FUNDER?.trim()
+      && process.env.POLYMARKET_FUNDER.trim().toLowerCase() !== this.wallet.address.toLowerCase())
+      ? process.env.POLYMARKET_FUNDER.trim()
+      : this.wallet.address
 
-    const domain = {
-      name:    'ClobAuthDomain',
-      version: '1',
-      chainId: CHAIN_ID,
+    console.log(`[CLOB] Derivando credenciales L1: address=${l1Address}`)
+    if (l1Address === this.wallet.address) {
+      console.warn('[CLOB] ⚠️  Usando EOA para L1 auth. Si falla, configura POLYMARKET_FUNDER=<proxy_wallet>.')
     }
+
+    const timestamp = Math.floor(Date.now() / 1000)
+    const domain    = { name: 'ClobAuthDomain', version: '1', chainId: CHAIN_ID }
     const authTypes = {
       ClobAuth: [
         { name: 'address',   type: 'address' },
@@ -533,7 +511,7 @@ export class ClobClient {
       ],
     }
     const authValue = {
-      address:   this.wallet.address,
+      address:   l1Address,   // proxy wallet (o EOA si no hay funder)
       timestamp: String(timestamp),
       nonce:     0,
       message:   'This message attests that I have read and agree to the terms of service.',
@@ -542,12 +520,11 @@ export class ClobClient {
     const sig = await this.wallet.signTypedData(domain, authTypes, authValue)
 
     // py-clob-client: requests.post(url, headers=headers, json={})
-    //   → method POST + Content-Type: application/json + body '{}'
-    const res  = await fetch(`${CLOB_HOST}/auth/api-key`, {
+    const res = await fetch(`${CLOB_HOST}/auth/api-key`, {
       method:  'POST',
       headers: {
         'Content-Type':   'application/json',
-        'POLY-ADDRESS':   this.wallet.address,
+        'POLY-ADDRESS':   l1Address,
         'POLY-SIGNATURE': sig,
         'POLY-TIMESTAMP': String(timestamp),
         'POLY-NONCE':     '0',
@@ -562,15 +539,18 @@ export class ClobClient {
     }
 
     const data: any = await res.json()
+    console.log('[CLOB] /auth/api-key raw:', JSON.stringify(data))
+
     const creds: L2Credentials = {
       apiKey:        data.apiKey        ?? data.key,
       apiSecret:     data.secret,
       apiPassphrase: data.passphrase,
-      walletAddress: this.wallet.address,
+      walletAddress: l1Address,
       derivedAt:     new Date().toISOString(),
     }
 
-    console.log(`[CLOB] ✅ Credenciales derivadas — apiKey: ${creds.apiKey.substring(0, 8)}…`)
+    console.log(`[CLOB] ✅ Credenciales derivadas para ${l1Address} — apiKey: ${creds.apiKey.substring(0, 8)}…`)
+    console.log('[CLOB]    Guarda en Railway: CLOB_API_KEY / CLOB_API_SECRET / CLOB_API_PASSPHRASE')
     await this.saveToSupabase(creds)
     return creds
   }
