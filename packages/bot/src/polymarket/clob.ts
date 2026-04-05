@@ -232,7 +232,9 @@ export class ClobClient {
     const sigType    = BigInt(2)    // 2 = POLY_GNOSIS_SAFE (confirmado on-chain por getSafeAddress)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
-    const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
+    // Taker es siempre ZeroAddress para órdenes públicas (BUY/SELL normales).
+    // NEG_RISK_ADAPTER solo se usa para mint/merge, no para limit orders.
+    const taker    = ethers.ZeroAddress
 
     // Resolver maker según signatureType (replica py-clob-client/signing/builders.py::_resolve_maker_address):
     //   SignatureType.EOA (0)         → maker = signer.address (EOA)
