@@ -275,9 +275,12 @@ export class ClobClient {
       signature,
     }
 
+    // owner = UUID de la API key L2 (NO una address).
+    // Replica exactamente py-clob-client: body = order_to_json(order, self.creds.api_key, orderType)
+    // El servidor verifica que owner === apiKey de tus credenciales L2.
     const bodyObj = {
       order:     orderPayload,
-      owner:     await this.resolveOwnerAddress(creds),
+      owner:     creds.apiKey,
       orderType: 'GTC',
       negRisk,
     }
