@@ -31,8 +31,12 @@ const SUPABASE_CREDS_KEY = 'clob_l2_credentials'
 //   signing/eip712.py → CTF_EXCHANGE_DOMAIN_NAME / NEG_RISK_EXCHANGE_DOMAIN_NAME
 // El dominio completo se construye en placeOrder() porque depende de negRisk.
 
-const CTF_EXCHANGE_DOMAIN_NAME      = 'Polymarket CTF Exchange'
-const NEG_RISK_EXCHANGE_DOMAIN_NAME = 'Polymarket NegRisk CTF Exchange'
+// ATENCIÓN: Tanto el CTFExchange (0x4bFb41d5…) como el NegRiskCtfExchange
+// (0xC5d563A3…) usan el MISMO domain name "Polymarket CTF Exchange".
+// NegRiskCtfExchange hereda de CTFExchange sin override del Hashing constructor,
+// por lo que ambos contratos tienen el mismo name. Lo único que cambia entre
+// ellos es el verifyingContract (dirección distinta).
+const CTF_EXCHANGE_DOMAIN_NAME = 'Polymarket CTF Exchange'
 
 // Tipos para la orden — idénticos a OrderData en py-clob-client
 const ORDER_TYPES = {
@@ -264,9 +268,10 @@ export class ClobClient {
     }
 
     // ── 4. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
-    // El nombre del dominio varía por negRisk — igual que py-clob-client/signing/eip712.py
+    // El name del dominio es el MISMO para ambos exchanges ("Polymarket CTF Exchange").
+    // Solo cambia el verifyingContract entre CTF_EXCHANGE y NEG_RISK_EXCHANGE.
     const domain = {
-      name:              negRisk ? NEG_RISK_EXCHANGE_DOMAIN_NAME : CTF_EXCHANGE_DOMAIN_NAME,
+      name:              CTF_EXCHANGE_DOMAIN_NAME,
       version:           '1',
       chainId:           CHAIN_ID,
       verifyingContract: exchange,
@@ -468,20 +473,29 @@ export class ClobClient {
 
     try {
       const exchange = new ethers.Contract(CTF_EXCHANGE, registryAbi, provider)
+      const negRiskExchange = new ethers.Contract(NEG_RISK_EXCHANGE, registryAbi, provider)
 
       let expectedSafe:  string | null = null
       let expectedProxy: string | null = null
+      let expectedSafeNR: string | null = null
 
       try {
         expectedSafe = await exchange.getSafeAddress(eoa)
-        console.log(`[CLOB-DIAG] getSafeAddress(EOA)            → ${expectedSafe}   [sigType=2 / Safe]`)
+        console.log(`[CLOB-DIAG] CTF Exchange.getSafeAddress(EOA)            → ${expectedSafe}   [sigType=2 / Safe]`)
       } catch (err: any) {
-        console.log(`[CLOB-DIAG] getSafeAddress(EOA)            → ERROR: ${err?.shortMessage ?? err?.message}`)
+        console.log(`[CLOB-DIAG] CTF Exchange.getSafeAddress(EOA)            → ERROR: ${err?.shortMessage ?? err?.message}`)
+      }
+
+      try {
+        expectedSafeNR = await negRiskExchange.getSafeAddress(eoa)
+        console.log(`[CLOB-DIAG] NegRisk Exchange.getSafeAddress(EOA)        → ${expectedSafeNR}   [sigType=2 / Safe — NegRisk]`)
+      } catch (err: any) {
+        console.log(`[CLOB-DIAG] NegRisk Exchange.getSafeAddress(EOA)        → ERROR: ${err?.shortMessage ?? err?.message}`)
       }
 
       try {
         expectedProxy = await exchange.getPolyProxyWalletAddress(eoa)
-        console.log(`[CLOB-DIAG] getPolyProxyWalletAddress(EOA) → ${expectedProxy}  [sigType=1 / Magic]`)
+        console.log(`[CLOB-DIAG] CTF Exchange.getPolyProxyWalletAddress(EOA) → ${expectedProxy}  [sigType=1 / Magic]`)
       } catch (err: any) {
         console.log(`[CLOB-DIAG] getPolyProxyWalletAddress(EOA) → ERROR: ${err?.shortMessage ?? err?.message}`)
       }
