@@ -213,16 +213,28 @@ export class ClobClient {
     // Igual que OrderData en py-clob-client/signing/model.py
     const salt       = BigInt(Math.floor(Math.random() * 1_000_000_000_000))
     const expiration = BigInt(0)    // GTC (no expira)
-    const nonce      = BigInt(0)
-    const sideValue  = BigInt(0)    // 0 = BUY
+    const nonce      = BigInt(0)    // 0 = BUY
+    const sideValue  = BigInt(0)
     const sigType    = BigInt(1)    // 1 = POLY_PROXY (signature_type en Python)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
     const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
 
+    // Resolver maker según signatureType (replica py-clob-client/signing/builders.py::_resolve_maker_address):
+    //   SignatureType.EOA (0)         → maker = signer.address (EOA)
+    //   SignatureType.POLY_PROXY (1)  → maker = funder (proxy wallet)
+    //   SignatureType.POLY_GNOSIS_SAFE (2) → maker = funder
+    // Con sigType=1, maker DEBE ser el funder o el servidor rechaza con "invalid signature".
+    const funderEnv = process.env.POLYMARKET_FUNDER?.trim()
+    if (sigType === BigInt(1) && (!funderEnv || !ethers.isAddress(funderEnv))) {
+      throw new Error('[CLOB] POLYMARKET_FUNDER env var no definido o inválido — requerido para signatureType=1 (POLY_PROXY)')
+    }
+    const makerAddress = sigType === BigInt(0) ? this.wallet.address : funderEnv!
+    console.log(`[CLOB] maker=${makerAddress} | signer=${this.wallet.address} | sigType=${sigType}`)
+
     const orderStruct = {
       salt:          salt,
-      maker:         this.wallet.address,
+      maker:         makerAddress,
       signer:        this.wallet.address,
       taker:         taker,
       tokenId:       BigInt(params.tokenId),
@@ -261,7 +273,7 @@ export class ClobClient {
     // Outer body añade 'owner' (maker address) — campo requerido por el servidor.
     const orderPayload = {
       salt:          Number(salt),             // número JSON, igual que Python int(order.salt)
-      maker:         this.wallet.address,
+      maker:         makerAddress,
       signer:        this.wallet.address,
       taker:         taker,
       tokenId:       params.tokenId,
