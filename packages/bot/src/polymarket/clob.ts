@@ -215,8 +215,8 @@ export class ClobClient {
     const expiration = BigInt(0)    // GTC (no expira)
     const nonce      = BigInt(0)    // 0 = BUY
     const sideValue  = BigInt(0)
-    const sigType    = BigInt(2)    // 2 = POLY_GNOSIS_SAFE (Safe proxy, p.ej. MetaMask en polymarket.com)
-                                    //   cambia a 1 si es Magic/email wallet (POLY_PROXY)
+    const sigType    = BigInt(1)    // 1 = POLY_PROXY (Magic/email wallet)
+                                    //   cambia a 2 si es Safe (MetaMask en polymarket.com)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
     const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
