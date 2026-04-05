@@ -216,16 +216,42 @@ export class ClobClient {
 
     // ── 2. Calcular amounts ───────────────────────────────────────────────
     // BUY: makerAmount = USDC a gastar, takerAmount = shares a recibir
-    // Python: size = stake / price  (en units de token)
-    const sharesFloat  = params.size / params.price    // shares = usdc / price
-    const makerAmount  = toMicroUsdc(params.size)      // USDC que pones
-    const takerAmount  = toShares(sharesFloat)         // tokens que recibes
+    //
+    // IMPORTANTE: el precio DEBE estar alineado al tickSize del mercado
+    // (ej. 0.01). Si no, el servidor rechaza con "breaks minimum tick size rule".
+    // Además, el ratio makerAmount/takerAmount tiene que dar EXACTAMENTE el
+    // precio (sin ruido de float), porque el servidor lo recalcula.
+    //
+    // Fetch tickSize del mercado (fallback 0.01 que es el estándar)
+    const tickSize = await this.getTickSize(params.tokenId)
+    console.log(`[CLOB] tickSize=${tickSize} para token ${params.tokenId.substring(0, 16)}…`)
+
+    // Redondear precio al tick grid. Para BUY, redondeamos HACIA ARRIBA para
+    // asegurar ejecución si el precio original estaba entre ticks.
+    const ticksPerUnit = Math.round(1 / tickSize)            // 100 si tickSize=0.01
+    const priceInTicks = Math.ceil(params.price * ticksPerUnit)  // 13 si price=0.125 → 0.13
+    const roundedPrice = priceInTicks / ticksPerUnit
+    if (roundedPrice !== params.price) {
+      console.log(`[CLOB] Precio redondeado al tick: ${params.price} → ${roundedPrice} (tickSize=${tickSize})`)
+    }
+
+    // Para que makerAmount/takerAmount == roundedPrice EXACTAMENTE,
+    // expresamos el ratio como priceInTicks/ticksPerUnit y forzamos
+    // makerAmount como múltiplo de priceInTicks.
+    //   roundedPrice = priceInTicks / ticksPerUnit = P/T
+    //   → makerAmount/takerAmount = P/T
+    //   → makerAmount = k * P, takerAmount = k * T
+    const desiredMaker = toMicroUsdc(params.size)
+    const kUnits = desiredMaker / BigInt(priceInTicks)       // división entera
+    const makerAmount = kUnits * BigInt(priceInTicks)
+    const takerAmount = kUnits * BigInt(ticksPerUnit)
+    const sharesFloat = Number(takerAmount) / 1_000_000
 
     console.log(
-      `[CLOB] Colocando orden: price=${params.price} | usdc=${params.size} | ` +
+      `[CLOB] Colocando orden: price=${roundedPrice} | usdc=${Number(makerAmount) / 1_000_000} | ` +
       `shares=${sharesFloat.toFixed(4)} | negRisk=${negRisk} | feeRateBps=${feeRateBpsInt}`
     )
-    console.log(`[CLOB] makerAmount=${makerAmount} | takerAmount=${takerAmount}`)
+    console.log(`[CLOB] makerAmount=${makerAmount} | takerAmount=${takerAmount} | ratio=${Number(makerAmount)/Number(takerAmount)}`)
 
     // ── 3. Construir struct EIP-712 de la orden ───────────────────────────
     // Igual que OrderData en py-clob-client/signing/model.py
@@ -377,6 +403,29 @@ export class ClobClient {
       status:     data?.status     ?? 'open',
       filledSize: parseFloat(data?.sizeFilled ?? data?.size_filled ?? '0'),
       price:      params.price,
+    }
+  }
+
+  // ── getTickSize ───────────────────────────────────────────────────────────
+  // Consulta el minimum_tick_size del mercado via Gamma API.
+  // Valores típicos: 0.01, 0.001, 0.0001. Fallback: 0.01.
+  async getTickSize(tokenId: string): Promise<number> {
+    try {
+      const res = await fetch(
+        `https://gamma-api.polymarket.com/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
+        { signal: AbortSignal.timeout(8_000) }
+      )
+      if (!res.ok) return 0.01
+      const data = await res.json() as any
+      const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
+      const m = markets[0]
+      if (!m) return 0.01
+      // Gamma puede devolver orderPriceMinTickSize (string) o similar
+      const raw = m.orderPriceMinTickSize ?? m.tick_size ?? m.minimum_tick_size ?? '0.01'
+      const tick = parseFloat(raw)
+      return (isNaN(tick) || tick <= 0) ? 0.01 : tick
+    } catch {
+      return 0.01
     }
   }
 
