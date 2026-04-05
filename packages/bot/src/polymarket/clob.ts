@@ -261,6 +261,16 @@ export class ClobClient {
     try {
       signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderStruct)
       console.log('[CLOB] Orden firmada correctamente')
+
+      // ── Verificación local de la firma ──
+      // Si recovered !== signer, nuestro proceso de firma está roto (domain/types/struct).
+      // Si recovered === signer pero el servidor rechaza → problema de ownership on-chain.
+      const recovered = ethers.verifyTypedData(domain, ORDER_TYPES, orderStruct, signature)
+      const matches = recovered.toLowerCase() === this.wallet.address.toLowerCase()
+      console.log(`[CLOB] verifyTypedData local: recovered=${recovered} | signer=${this.wallet.address} | ${matches ? '✅ OK' : '❌ MISMATCH'}`)
+      if (!matches) {
+        throw new Error(`[CLOB] Firma local inválida: recovered ${recovered} !== signer ${this.wallet.address}`)
+      }
     } catch (err) {
       console.error('[CLOB] Error firmando orden:', err)
       throw err
