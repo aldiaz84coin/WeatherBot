@@ -215,7 +215,8 @@ export class ClobClient {
     const expiration = BigInt(0)    // GTC (no expira)
     const nonce      = BigInt(0)    // 0 = BUY
     const sideValue  = BigInt(0)
-    const sigType    = BigInt(1)    // 1 = POLY_PROXY (signature_type en Python)
+    const sigType    = BigInt(2)    // 2 = POLY_GNOSIS_SAFE (Safe proxy, p.ej. MetaMask en polymarket.com)
+                                    //   cambia a 1 si es Magic/email wallet (POLY_PROXY)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
     const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
@@ -226,8 +227,8 @@ export class ClobClient {
     //   SignatureType.POLY_GNOSIS_SAFE (2) → maker = funder
     // Con sigType=1, maker DEBE ser el funder o el servidor rechaza con "invalid signature".
     const funderEnv = process.env.POLYMARKET_FUNDER?.trim()
-    if (sigType === BigInt(1) && (!funderEnv || !ethers.isAddress(funderEnv))) {
-      throw new Error('[CLOB] POLYMARKET_FUNDER env var no definido o inválido — requerido para signatureType=1 (POLY_PROXY)')
+    if (sigType !== BigInt(0) && (!funderEnv || !ethers.isAddress(funderEnv))) {
+      throw new Error('[CLOB] POLYMARKET_FUNDER env var no definido o inválido — requerido para signatureType 1/2 (proxy wallets)')
     }
     const makerAddress = sigType === BigInt(0) ? this.wallet.address : funderEnv!
     console.log(`[CLOB] maker=${makerAddress} | signer=${this.wallet.address} | sigType=${sigType}`)
@@ -283,7 +284,7 @@ export class ClobClient {
       nonce:         nonce.toString(),
       feeRateBps:    feeRateBps.toString(),
       side:          'BUY',                    // string, igual que Python SignedOrder.side
-      signatureType: 1,
+      signatureType: Number(sigType),
       signature,
     }
 
