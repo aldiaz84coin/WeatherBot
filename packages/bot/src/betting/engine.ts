@@ -9,9 +9,10 @@
 //   4. Calcular token_a = ceil(ensemble_ajustado), token_b = ceil+1
 //   5. Repartir el stake de forma que se compren el MISMO nº de shares
 //      de cada token: shares = stake / (priceA + priceB)
-//   6. Guardar predicción + trades en Supabase (tablas existentes)
-//   7. Crear fila en betting_cycles para tracking de la Martingala
-//   8. Loggear todo en bot_events
+//   6. Si modo live → ejecutar órdenes CLOB reales en Polymarket
+//   7. Guardar predicción + trades en Supabase (tablas existentes)
+//   8. Crear fila en betting_cycles para tracking de la Martingala
+//   9. Loggear todo en bot_events
 // ──────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config'
@@ -22,6 +23,7 @@ import { buildPosition } from '../prediction/position'
 import { BotEventLogger } from './logger'
 import { getStakeConfig } from './config'
 import { getCurrentBias } from './bias-optimizer'
+import { ClobClient } from '../polymarket/clob'
 
 const logger = new BotEventLogger('ENGINE')
 
@@ -116,6 +118,54 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   const costA      = shares * (priceA ?? 0)
   const costB      = shares * (priceB ?? 0)
 
+  // ── 6.5. Ejecutar órdenes CLOB reales (solo si live) ──────────────────────
+  // FIX: antes el ciclo automático NUNCA ejecutaba órdenes, solo persistía en
+  // Supabase. Ahora usa el mismo mecanismo que live-switch / retry-orders /
+  // manual-buy-handler (ClobClient.placeOrder con def.token.tokenId).
+  let orderIdA: string | null = null
+  let orderIdB: string | null = null
+
+  if (!isSimulated) {
+    const clob = new ClobClient(
+      process.env.POLYMARKET_API_KEY!,
+      process.env.POLYMARKET_PRIVATE_KEY!
+    )
+
+    const orderDefs = [
+      { slot: 'a' as const, token: position.tokenA, tempCelsius: tokenA, cost: costA, price: priceA },
+      { slot: 'b' as const, token: position.tokenB, tempCelsius: tokenB, cost: costB, price: priceB },
+    ]
+
+    for (const def of orderDefs) {
+      if (!def.price) {
+        await logger.log('warn', 'prediction',
+          `   ⚠️  Token ${def.tempCelsius}°C (${def.slot}): precio no disponible — orden omitida`
+        )
+        continue
+      }
+      try {
+        const order = await clob.placeOrder({
+          tokenId: def.token.tokenId,
+          side:    'BUY',
+          price:   def.price,
+          size:    def.cost,
+        })
+        if (def.slot === 'a') orderIdA = order.orderId
+        else                  orderIdB = order.orderId
+
+        await logger.log('success', 'prediction',
+          `   ✅ Orden REAL ejecutada: ${def.tempCelsius}°C (${def.slot}) ` +
+          `@ ${(def.price * 100).toFixed(1)}¢ · $${def.cost.toFixed(2)} USDC → orderId: ${order.orderId}`
+        )
+      } catch (err: any) {
+        await logger.error(
+          `   ❌ Error orden ${def.tempCelsius}°C (${def.slot}): ${err?.message ?? err}`,
+          err
+        )
+      }
+    }
+  }
+
   // ── 7. Persistir predicción ───────────────────────────────────────────────
   const { data: prediction, error: predError } = await supabase
     .from('predictions')
@@ -148,30 +198,34 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   }
 
   // ── 8. Persistir trades ───────────────────────────────────────────────────
+  // FIX: incluir polymarket_order_id (antes faltaba — los trades live quedaban
+  // sin referencia a la orden real en Polymarket).
   const { error: tradesError } = await supabase
     .from('trades')
     .insert([
       {
-        prediction_id: prediction.id,
-        slug:          position.tokenA.slug,
-        token_temp:    tokenA,
-        position:      'a',
-        cost_usdc:     costA,
-        price_at_buy:  priceA,
+        prediction_id:       prediction.id,
+        slug:                position.tokenA.slug,
+        token_temp:          tokenA,
+        position:            'a',
+        cost_usdc:           costA,
+        price_at_buy:        priceA,
         shares,
-        simulated:     isSimulated,
-        status:        'open',
+        simulated:           isSimulated,
+        status:              'open',
+        polymarket_order_id: orderIdA,
       },
       {
-        prediction_id: prediction.id,
-        slug:          position.tokenB.slug,
-        token_temp:    tokenB,
-        position:      'b',
-        cost_usdc:     costB,
-        price_at_buy:  priceB,
+        prediction_id:       prediction.id,
+        slug:                position.tokenB.slug,
+        token_temp:          tokenB,
+        position:            'b',
+        cost_usdc:           costB,
+        price_at_buy:        priceB,
         shares,
-        simulated:     isSimulated,
-        status:        'open',
+        simulated:           isSimulated,
+        status:              'open',
+        polymarket_order_id: orderIdB,
       },
     ])
 
@@ -191,13 +245,13 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       base_stake_usdc: stake.baseStake,
       stake_usdc:      totalStake,
       multiplier:      stake.multiplier,
-      token_a_temp:    tokenA,        // ← FIX: antes faltaba
-      token_b_temp:    tokenB,        // ← FIX: antes faltaba
-      price_a:         priceA,        // ← FIX: antes faltaba
-      price_b:         priceB,        // ← FIX: antes faltaba
-      shares:          shares,        // ← FIX: antes faltaba
-      cost_a_usdc:     costA,         // ← FIX: antes faltaba
-      cost_b_usdc:     costB,         // ← FIX: antes faltaba
+      token_a_temp:    tokenA,
+      token_b_temp:    tokenB,
+      price_a:         priceA,
+      price_b:         priceB,
+      shares:          shares,
+      cost_a_usdc:     costA,
+      cost_b_usdc:     costB,
       status:          'open',
       simulated:       isSimulated,
     })
@@ -210,12 +264,16 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
   }
 
   // ── 10. Log resumen ───────────────────────────────────────────────────────
+  const orderSummary = isSimulated
+    ? 'SIM (sin órdenes reales)'
+    : `orders=[${orderIdA ?? 'FAILED'}, ${orderIdB ?? 'FAILED'}]`
+
   await logger.log('success', 'prediction',
     `✅ Ciclo creado — ${tomorrow} | ` +
     `Tokens: ${tokenA}°/${tokenB}° | ` +
     `Stake: $${totalStake.toFixed(2)} (×${stake.multiplier}) | ` +
     `Precios: ${priceA ? (priceA * 100).toFixed(0) : '?'}¢/${priceB ? (priceB * 100).toFixed(0) : '?'}¢ | ` +
-    `Modo: ${stake.bettingMode}`,
+    `Modo: ${stake.bettingMode} | ${orderSummary}`,
     {
       cycleId:      cycle.id,
       predictionId: prediction.id,
@@ -223,6 +281,8 @@ export async function runBettingCycle(targetDate?: string): Promise<void> {
       shares:       parseFloat(shares.toFixed(4)),
       stake:        totalStake,
       biasN,
+      orderIdA,
+      orderIdB,
     }
   )
 }
@@ -293,9 +353,6 @@ async function createCycleFromExistingPrediction(
   const tokenB  = pred?.token_b      ?? null
   const costA   = pred?.cost_a_usdc  ?? null
   const costB   = pred?.cost_b_usdc  ?? null
-  const shares  = (costA != null && costB != null && (costA + costB) > 0)
-    ? totalStake / (costA + costB) * (costA / totalStake * totalStake / (pred?.stake_usdc ?? totalStake) * totalStake)
-    : null
 
   const { error } = await supabase
     .from('betting_cycles')
@@ -305,10 +362,10 @@ async function createCycleFromExistingPrediction(
       base_stake_usdc: stake.baseStake,
       stake_usdc:      totalStake,
       multiplier:      stake.multiplier,
-      token_a_temp:    tokenA,   // ← FIX
-      token_b_temp:    tokenB,   // ← FIX
-      cost_a_usdc:     costA,    // ← FIX
-      cost_b_usdc:     costB,    // ← FIX
+      token_a_temp:    tokenA,
+      token_b_temp:    tokenB,
+      cost_a_usdc:     costA,
+      cost_b_usdc:     costB,
       status:          'open',
       simulated:       isSimulated,
     })
@@ -321,4 +378,13 @@ async function createCycleFromExistingPrediction(
       `Tokens: ${tokenA}°/${tokenB}° | Stake: $${totalStake} (×${stake.multiplier})`
     )
   }
+}
+
+// ─── Entrypoint directo ───────────────────────────────────────────────────────
+
+if (require.main === module) {
+  runBettingCycle().catch(err => {
+    console.error('Fatal en runBettingCycle:', err)
+    process.exit(1)
+  })
 }
