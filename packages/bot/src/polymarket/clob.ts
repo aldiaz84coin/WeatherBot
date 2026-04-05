@@ -26,14 +26,18 @@ const CHAIN_ID           = 137                    // Polygon
 const SUPABASE_CREDS_KEY = 'clob_l2_credentials'
 
 // ─── EIP-712 ──────────────────────────────────────────────────────────────────
-// Dominio y tipos idénticos a los del contrato CTF Exchange de Polymarket
-// Fuente: https://github.com/Polymarket/py-clob-client/blob/main/py_clob_client/signing/model.py
+// Dominios para firma de ÓRDENES — distintos del dominio de auth L1.
+// Fuente: py-clob-client/signing/eip712.py → LOB_EXCHANGE_DOMAIN_NAME
+//
+// ⚠️  'ClobAuthDomain' es SOLO para autenticación L1 (derivar API key).
+//     Para órdenes el contrato CTF Exchange verifica con su propio nombre.
+//
+// Python equivalente:
+//   CTF_EXCHANGE_DOMAIN_NAME      = "Polymarket CTF Exchange"
+//   NEG_RISK_EXCHANGE_DOMAIN_NAME = "Polymarket NegRisk CTF Exchange"
 
-const EIP712_DOMAIN = {
-  name:              'ClobAuthDomain',
-  version:           '1',
-  chainId:           CHAIN_ID,
-}
+const CTF_EXCHANGE_DOMAIN_NAME      = 'Polymarket CTF Exchange'
+const NEG_RISK_EXCHANGE_DOMAIN_NAME = 'Polymarket NegRisk CTF Exchange'
 
 // Tipos para la orden — idénticos a OrderData en py-clob-client
 const ORDER_TYPES = {
@@ -237,8 +241,11 @@ export class ClobClient {
     }
 
     // ── 4. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
+    // El dominio varía según negRisk — igual que py-clob-client/signing/eip712.py
     const domain = {
-      ...EIP712_DOMAIN,
+      name:              negRisk ? NEG_RISK_EXCHANGE_DOMAIN_NAME : CTF_EXCHANGE_DOMAIN_NAME,
+      version:           '1',
+      chainId:           CHAIN_ID,
       verifyingContract: exchange,
     }
 
