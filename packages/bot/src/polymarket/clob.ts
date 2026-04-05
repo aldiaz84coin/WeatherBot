@@ -185,6 +185,9 @@ export class ClobClient {
       throw new Error('ClobClient: LIVE_TRADING is not enabled — aborting real order')
     }
 
+    // Diagnóstico on-chain del proxy (solo la primera vez)
+    await this.diagnoseProxyOnce()
+
     const creds   = await this.getCredentials()
     const negRisk = params.negRisk ?? await this.getNegRisk(params.tokenId)
 
@@ -379,6 +382,84 @@ export class ClobClient {
   }
 
   private ownerAddressCache: string | null = null
+  private diagnosedProxy: boolean = false
+
+  // Diagnóstico on-chain: consulta al CTFExchange qué direcciones de proxy
+  // corresponden a esta EOA y las compara con POLYMARKET_FUNDER.
+  // Se ejecuta una sola vez por instancia del proceso.
+  async diagnoseProxyOnce(): Promise<void> {
+    if (this.diagnosedProxy) return
+    this.diagnosedProxy = true
+
+    const rpcUrl = process.env.POLYGON_RPC_URL ?? 'https://polygon-rpc.com'
+    const eoa = this.wallet.address
+    const funderEnv = process.env.POLYMARKET_FUNDER?.trim()
+
+    console.log('[CLOB-DIAG] ══════ Diagnóstico on-chain del proxy ══════')
+    console.log(`[CLOB-DIAG] RPC: ${rpcUrl}`)
+    console.log(`[CLOB-DIAG] EOA (signer):   ${eoa}`)
+    console.log(`[CLOB-DIAG] POLYMARKET_FUNDER (env): ${funderEnv ?? '(no definido)'}`)
+
+    const registryAbi = [
+      'function getSafeAddress(address signer) external view returns (address)',
+      'function getPolyProxyWalletAddress(address signer) external view returns (address)',
+    ]
+
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl)
+      const exchange = new ethers.Contract(CTF_EXCHANGE, registryAbi, provider)
+
+      let expectedSafe:  string | null = null
+      let expectedProxy: string | null = null
+
+      try {
+        expectedSafe = await exchange.getSafeAddress(eoa)
+        console.log(`[CLOB-DIAG] getSafeAddress(EOA)            → ${expectedSafe}   [sigType=2 / Safe]`)
+      } catch (err: any) {
+        console.log(`[CLOB-DIAG] getSafeAddress(EOA)            → ERROR: ${err?.shortMessage ?? err?.message}`)
+      }
+
+      try {
+        expectedProxy = await exchange.getPolyProxyWalletAddress(eoa)
+        console.log(`[CLOB-DIAG] getPolyProxyWalletAddress(EOA) → ${expectedProxy}  [sigType=1 / Magic]`)
+      } catch (err: any) {
+        console.log(`[CLOB-DIAG] getPolyProxyWalletAddress(EOA) → ERROR: ${err?.shortMessage ?? err?.message}`)
+      }
+
+      if (funderEnv) {
+        const fLower = funderEnv.toLowerCase()
+        const matchSafe  = expectedSafe?.toLowerCase()  === fLower
+        const matchProxy = expectedProxy?.toLowerCase() === fLower
+
+        if (matchSafe) {
+          console.log('[CLOB-DIAG] ✅ POLYMARKET_FUNDER coincide con Safe → USA sigType=2')
+        } else if (matchProxy) {
+          console.log('[CLOB-DIAG] ✅ POLYMARKET_FUNDER coincide con Magic proxy → USA sigType=1')
+        } else {
+          console.log('[CLOB-DIAG] ❌ POLYMARKET_FUNDER NO coincide con ningún proxy derivado de la EOA')
+          console.log('[CLOB-DIAG]    Opciones para arreglar:')
+          if (expectedSafe)  console.log(`[CLOB-DIAG]    → Safe:  POLYMARKET_FUNDER=${expectedSafe} + sigType=2`)
+          if (expectedProxy) console.log(`[CLOB-DIAG]    → Magic: POLYMARKET_FUNDER=${expectedProxy} + sigType=1`)
+        }
+      }
+
+      // Balance USDC.e del funder actual
+      if (funderEnv) {
+        try {
+          const usdcAbi = ['function balanceOf(address) view returns (uint256)']
+          const usdc = new ethers.Contract(COLLATERAL_TOKEN, usdcAbi, provider)
+          const balance: bigint = await usdc.balanceOf(funderEnv)
+          console.log(`[CLOB-DIAG] Balance USDC.e del funder: ${ethers.formatUnits(balance, 6)} USDC`)
+        } catch (err: any) {
+          console.log(`[CLOB-DIAG] No se pudo leer balance USDC: ${err?.shortMessage ?? err?.message}`)
+        }
+      }
+    } catch (err: any) {
+      console.log(`[CLOB-DIAG] ERROR conectando a Polygon RPC: ${err?.shortMessage ?? err?.message}`)
+    }
+
+    console.log('[CLOB-DIAG] ════════════════════════════════════════════')
+  }
 
   async resolveOwnerAddress(creds: L2Credentials): Promise<string> {
     if (process.env.POLYMARKET_FUNDER) {
