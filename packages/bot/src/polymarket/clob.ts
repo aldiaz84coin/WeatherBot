@@ -191,6 +191,9 @@ export class ClobClient {
     const creds   = await this.getCredentials()
     const negRisk = params.negRisk ?? await this.getNegRisk(params.tokenId)
 
+    // Log detalles del mercado para debug
+    await this.logMarketInfo(params.tokenId)
+
     // ── 1. Fetch feeRateBps dinámico desde /fee-rate ──────────────────────
     // CRÍTICO: desde 2026, weather markets también tienen fees.
     // Si feeRateBps no coincide con el valor del servidor → Invalid order payload
@@ -218,8 +221,7 @@ export class ClobClient {
     const expiration = BigInt(0)    // GTC (no expira)
     const nonce      = BigInt(0)    // 0 = BUY
     const sideValue  = BigInt(0)
-    const sigType    = BigInt(1)    // 1 = POLY_PROXY (Magic/email wallet)
-                                    //   cambia a 2 si es Safe (MetaMask en polymarket.com)
+    const sigType    = BigInt(2)    // 2 = POLY_GNOSIS_SAFE (confirmado on-chain por getSafeAddress)
 
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE
     const taker    = negRisk ? NEG_RISK_ADAPTER  : ethers.ZeroAddress
@@ -494,6 +496,34 @@ export class ClobClient {
     }
 
     console.log('[CLOB-DIAG] ════════════════════════════════════════════')
+  }
+
+  // Fetch info de un mercado específico desde el CLOB REST para ver neg_risk
+  async logMarketInfo(tokenId: string): Promise<void> {
+    try {
+      const res = await fetch(
+        `${CLOB_HOST}/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
+        { signal: AbortSignal.timeout(8_000) }
+      )
+      const data: any = await res.json()
+      const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
+      const m = markets[0]
+      if (!m) {
+        console.log(`[CLOB-MARKET] No se encontró mercado para token ${tokenId.substring(0, 16)}…`)
+        return
+      }
+      console.log(`[CLOB-MARKET] token=${tokenId.substring(0, 16)}…`)
+      console.log(`[CLOB-MARKET]   question:        ${m.question ?? '?'}`)
+      console.log(`[CLOB-MARKET]   neg_risk:        ${m.neg_risk}`)
+      console.log(`[CLOB-MARKET]   tick_size:       ${m.tick_size ?? m.minimum_tick_size ?? '?'}`)
+      console.log(`[CLOB-MARKET]   minimum_order_size: ${m.minimum_order_size ?? '?'}`)
+      console.log(`[CLOB-MARKET]   accepting_orders: ${m.accepting_orders}`)
+      console.log(`[CLOB-MARKET]   active:          ${m.active}`)
+      console.log(`[CLOB-MARKET]   closed:          ${m.closed}`)
+      console.log(`[CLOB-MARKET]   condition_id:    ${m.condition_id ?? '?'}`)
+    } catch (err: any) {
+      console.log(`[CLOB-MARKET] Error: ${err?.message}`)
+    }
   }
 
   async resolveOwnerAddress(creds: L2Credentials): Promise<string> {
