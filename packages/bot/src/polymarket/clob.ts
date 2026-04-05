@@ -275,12 +275,7 @@ export class ClobClient {
       signature,
     }
 
-    // ── 6. Owner address: proxy wallet, NO el EOA ────────────────────────
-    // En Polymarket POLY_PROXY (signature_type=1):
-    //   - maker/signer en EIP-712 = EOA (quien firma con la private key)
-    //   - owner en el body REST   = proxy wallet (la cuenta Polymarket real)
-    // Python equivalente: cfg["polymarket"]["funder"] = proxy wallet address
-    // → Configura POLYMARKET_FUNDER en Railway con tu proxy wallet address.
+    // owner = proxy wallet (distinta del EOA) — resolveOwnerAddress lo descubre
     const ownerAddress = await this.resolveOwnerAddress(creds)
 
     const bodyObj = {
@@ -295,12 +290,13 @@ export class ClobClient {
 
     const l2Headers = buildL2Headers(creds, 'POST', path, body, timestamp)
 
-    // ── 7. Log completo del payload para debug ────────────────────────────
-    console.log('[CLOB] ── PAYLOAD ───────────────────────────────────────')
-    console.log('[CLOB] domain: ' + JSON.stringify({ name: domain.name, verifyingContract: exchange }))
+    // ── 6. Enviar al CLOB REST API ────────────────────────────────────────
+    // Log completo del payload para debug — muestra todo excepto la private key
+    console.log('[CLOB] ── PAYLOAD COMPLETO ──────────────────────────────')
     console.log('[CLOB] owner:  ' + ownerAddress + ' | EOA: ' + this.wallet.address)
+    console.log('[CLOB] domain: ' + JSON.stringify({ name: domain.name, verifyingContract: exchange }))
     console.log('[CLOB] body:   ' + body)
-    console.log('[CLOB] ─────────────────────────────────────────────────')
+    console.log('[CLOB] ────────────────────────────────────────────────────')
     console.log('[CLOB] Enviando orden al CLOB REST API…')
     let res: Response
     try {
@@ -360,57 +356,81 @@ export class ClobClient {
   }
 
   // ── resolveOwnerAddress ──────────────────────────────────────────────────
-  // Devuelve el 'owner' correcto para el body de POST /order.
-  //
-  // En Polymarket POLY_PROXY (signature_type=1), el 'owner' NO es el EOA sino
-  // la proxy wallet (contrato desplegado por Polymarket para tu cuenta).
-  // Python: cfg["polymarket"]["funder"] = proxy wallet address.
+  // En Polymarket POLY_PROXY el 'owner' de POST /order es la PROXY WALLET,
+  // no el EOA. Python: cfg["polymarket"]["funder"] = proxy wallet.
   //
   // Prioridad:
-  //   1. POLYMARKET_FUNDER env var  ← configura en Railway
-  //   2. Auto-discovery via GET /auth/api-key
-  //   3. EOA como fallback (loguea advertencia)
+  //   1. POLYMARKET_FUNDER env var (debe ser la proxy, NO el EOA)
+  //   2. POST /auth/api-key con L1 auth → campo 'funder' en la respuesta
+  //   3. EOA como fallback (va a fallar, pero loguea la pista)
 
   private ownerAddressCache: string | null = null
 
   async resolveOwnerAddress(creds: L2Credentials): Promise<string> {
-    // 1. Env var explícita (equivalente a funder en Python)
+    // 1. Env var explícita
     if (process.env.POLYMARKET_FUNDER) {
       const addr = process.env.POLYMARKET_FUNDER.trim()
-      console.log(`[CLOB] owner → POLYMARKET_FUNDER: ${addr}`)
-      return addr
+      if (addr.toLowerCase() === this.wallet.address.toLowerCase()) {
+        console.warn('[CLOB] ⚠️  POLYMARKET_FUNDER == EOA — incorrecto. Intentando discovery…')
+      } else {
+        console.log(`[CLOB] owner → POLYMARKET_FUNDER: ${addr}`)
+        return addr
+      }
     }
 
     // 2. Caché en memoria
     if (this.ownerAddressCache) return this.ownerAddressCache
 
-    // 3. Auto-discovery: GET /auth/api-key con L2 headers
+    // 3. POST /auth/api-key con L1 auth (mismo que deriveCredentials)
+    //    La respuesta incluye 'funder' = proxy wallet address
     try {
+      console.log('[CLOB] Descubriendo proxy wallet via L1 auth…')
       const timestamp = Math.floor(Date.now() / 1000)
-      const l2Headers = buildL2Headers(creds, 'GET', '/auth/api-key', '', timestamp)
-      const res = await fetch(`${CLOB_HOST}/auth/api-key`, {
-        headers: l2Headers,
-        signal:  AbortSignal.timeout(8_000),
-      })
-      if (res.ok) {
-        const data: any = await res.json()
-        const discovered = data?.funder ?? data?.address ?? data?.proxyWallet ?? null
-        if (discovered && ethers.isAddress(discovered)) {
-          console.log(`[CLOB] owner → auto-discovery: ${discovered}`)
-          this.ownerAddressCache = discovered
-          return discovered
-        }
-        // Log completo para que puedas ver qué devuelve y encontrar el campo correcto
-        console.log('[CLOB] /auth/api-key raw (para diagnóstico):', JSON.stringify(data))
+      const authDomain = { name: 'ClobAuthDomain', version: '1', chainId: CHAIN_ID }
+      const authTypes  = {
+        ClobAuth: [
+          { name: 'address',   type: 'address' },
+          { name: 'timestamp', type: 'string'  },
+          { name: 'nonce',     type: 'uint256' },
+          { name: 'message',   type: 'string'  },
+        ],
       }
+      const authValue = {
+        address:   this.wallet.address,
+        timestamp: String(timestamp),
+        nonce:     0,
+        message:   'This message attests that I have read and agree to the terms of service.',
+      }
+      const sig = await this.wallet.signTypedData(authDomain, authTypes, authValue)
+      const res = await fetch(`${CLOB_HOST}/auth/api-key`, {
+        method:  'POST',
+        headers: {
+          'POLY-ADDRESS':   this.wallet.address,
+          'POLY-SIGNATURE': sig,
+          'POLY-TIMESTAMP': String(timestamp),
+          'POLY-NONCE':     '0',
+        },
+        signal: AbortSignal.timeout(10_000),
+      })
+      const data: any = await res.json()
+      console.log('[CLOB] L1 /auth/api-key raw:', JSON.stringify(data))
+
+      const discovered = data?.funder ?? data?.proxyWallet ?? data?.proxy_wallet ?? null
+      if (discovered && ethers.isAddress(discovered)
+          && discovered.toLowerCase() !== this.wallet.address.toLowerCase()) {
+        console.log(`[CLOB] ✅ Proxy wallet: ${discovered}`)
+        console.log(`[CLOB]    💡 Añade en Railway: POLYMARKET_FUNDER=${discovered}`)
+        this.ownerAddressCache = discovered
+        return discovered
+      }
+      console.warn('[CLOB] Campos en respuesta:', Object.keys(data ?? {}))
     } catch (err: any) {
-      console.warn('[CLOB] Auto-discovery owner fallida:', err?.message)
+      console.warn('[CLOB] L1 discovery fallida:', err?.message)
     }
 
-    // 4. Fallback al EOA
-    console.warn('[CLOB] ⚠️  No se resolvió proxy wallet — usando EOA como owner.')
-    console.warn('[CLOB]    Si falla: añade POLYMARKET_FUNDER=<proxy_wallet> en Railway.')
-    console.warn('[CLOB]    La proxy wallet = cfg["polymarket"]["funder"] en el bot Python.')
+    // 4. Fallback — casi seguro que falla
+    console.warn('[CLOB] ⚠️  Usando EOA como owner — probablemente fallará.')
+    console.warn('[CLOB]    Busca cfg["polymarket"]["funder"] en el bot Python y ponlo como POLYMARKET_FUNDER.')
     return this.wallet.address
   }
 
@@ -532,7 +552,7 @@ export class ClobClient {
     const sig = await this.wallet.signTypedData(domain, authTypes, authValue)
 
     const res  = await fetch(`${CLOB_HOST}/auth/api-key`, {
-      method:  'GET',
+      method:  'POST',  // py-clob-client: self.post('/auth/api-key') — NO GET
       headers: {
         'POLY-ADDRESS':   this.wallet.address,
         'POLY-SIGNATURE': sig,
