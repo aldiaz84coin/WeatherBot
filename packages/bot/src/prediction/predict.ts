@@ -116,7 +116,7 @@ export async function runDailyPrediction() {
       token_b:           position.tokenB.tempCelsius,
       cost_a_usdc:       position.tokenA.costUsdc,
       cost_b_usdc:       position.tokenB.costUsdc,
-      stake_usdc:        position.totalCostUsdc,   // 0.80 USDC
+      stake_usdc:        position.totalCostUsdc,
       comparison_source: false,
       // columnas legacy (null en modelo nuevo)
       token_low:         null,
@@ -139,6 +139,9 @@ export async function runDailyPrediction() {
   console.log(`   ✅ Prediction guardada (id: ${prediction.id})`)
 
   // ── 6. Guardar trades + ejecutar si LIVE ───────────────────────────────────
+  // FIX: antes se pasaba tokenId: token.slug — pero `slug` es el market slug
+  // (string tipo "will-it-be-30c…"), NO el CLOB token ID. El correcto es
+  // token.tokenId, igual que en live-switch / retry-orders / manual-buy-handler.
   const clob = isLive ? new ClobClient(
     process.env.POLYMARKET_API_KEY!,
     process.env.POLYMARKET_PRIVATE_KEY!
@@ -150,15 +153,15 @@ export async function runDailyPrediction() {
     if (isLive && clob && token.priceAtBuy && position.marketAvailable) {
       try {
         const order = await clob.placeOrder({
-          tokenId: token.slug,
+          tokenId: token.tokenId,      // ← FIX: antes era token.slug (INCORRECTO)
           side:    'BUY',
           price:   token.priceAtBuy,
           size:    token.costUsdc,
         })
         polymarketOrderId = order.orderId
-        console.log(`   ✅ Orden LIVE: ${token.slug} → ${order.orderId}`)
+        console.log(`   ✅ Orden LIVE: ${token.tempCelsius}°C (${token.slot}) → ${order.orderId}`)
       } catch (err) {
-        console.error(`   ❌ Error ejecutando orden ${token.slug}:`, err)
+        console.error(`   ❌ Error ejecutando orden ${token.tempCelsius}°C (${token.slot}):`, err)
       }
     }
 
