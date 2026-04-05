@@ -486,8 +486,7 @@ export class ClobClient {
     const timestamp = Math.floor(Date.now() / 1000)
     const msg = `${timestamp}GET/auth/api-key`
 
-    // personal_sign (EIP-191): prefija "Ethereum Signed Message:
-" + mensaje
+    // personal_sign (EIP-191): igual que web3 encode_defunct + sign_message
     const sig = await this.wallet.signMessage(msg)
 
     console.log(`[CLOB] Derivando credenciales L1 (personal_sign): ${msg}`)
