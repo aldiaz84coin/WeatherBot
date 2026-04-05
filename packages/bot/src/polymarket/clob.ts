@@ -26,15 +26,10 @@ const CHAIN_ID           = 137                    // Polygon
 const SUPABASE_CREDS_KEY = 'clob_l2_credentials'
 
 // ─── EIP-712 ──────────────────────────────────────────────────────────────────
-// Dominios para firma de ÓRDENES — distintos del dominio de auth L1.
-// Fuente: py-clob-client/signing/eip712.py → LOB_EXCHANGE_DOMAIN_NAME
-//
-// ⚠️  'ClobAuthDomain' es SOLO para autenticación L1 (derivar API key).
-//     Para órdenes el contrato CTF Exchange verifica con su propio nombre.
-//
-// Python equivalente:
-//   CTF_EXCHANGE_DOMAIN_NAME      = "Polymarket CTF Exchange"
-//   NEG_RISK_EXCHANGE_DOMAIN_NAME = "Polymarket NegRisk CTF Exchange"
+// ATENCIÓN: 'ClobAuthDomain' es para /auth/api-key (L1 auth) ÚNICAMENTE.
+// Las ÓRDENES usan el nombre del contrato CTF Exchange — igual que py-clob-client:
+//   signing/eip712.py → CTF_EXCHANGE_DOMAIN_NAME / NEG_RISK_EXCHANGE_DOMAIN_NAME
+// El dominio completo se construye en placeOrder() porque depende de negRisk.
 
 const CTF_EXCHANGE_DOMAIN_NAME      = 'Polymarket CTF Exchange'
 const NEG_RISK_EXCHANGE_DOMAIN_NAME = 'Polymarket NegRisk CTF Exchange'
@@ -241,7 +236,7 @@ export class ClobClient {
     }
 
     // ── 4. Firmar con EIP-712 (ethers v6 nativo, sin SDK JS) ─────────────
-    // El dominio varía según negRisk — igual que py-clob-client/signing/eip712.py
+    // El nombre del dominio varía por negRisk — igual que py-clob-client/signing/eip712.py
     const domain = {
       name:              negRisk ? NEG_RISK_EXCHANGE_DOMAIN_NAME : CTF_EXCHANGE_DOMAIN_NAME,
       version:           '1',
@@ -259,9 +254,13 @@ export class ClobClient {
     }
 
     // ── 5. Construir payload JSON para POST /order ────────────────────────
-    // side debe ser número (0), NO string 'BUY' — confirmado en SignedOrder interface
+    // Replica exactamente order_to_json() de py-clob-client/order_builder.py:
+    //   - salt:          int(order.salt)   → número JSON  (no string)
+    //   - side:          order.side        → "BUY" string (no número 0)
+    //   - signatureType: int               → número JSON  ✓ (ya estaba bien)
+    // Outer body añade 'owner' (maker address) — campo requerido por el servidor.
     const orderPayload = {
-      salt:          salt.toString(),
+      salt:          Number(salt),             // número JSON, igual que Python int(order.salt)
       maker:         this.wallet.address,
       signer:        this.wallet.address,
       taker:         taker,
@@ -270,19 +269,31 @@ export class ClobClient {
       takerAmount:   takerAmount.toString(),
       expiration:    expiration.toString(),
       nonce:         nonce.toString(),
-      feeRateBps:    feeRateBps.toString(),   // ← valor real del servidor
-      side:          0,                        // ← número, no string
+      feeRateBps:    feeRateBps.toString(),
+      side:          'BUY',                    // string, igual que Python SignedOrder.side
       signatureType: 1,
       signature,
     }
 
-    const body      = JSON.stringify({ order: orderPayload, orderType: 'GTC', negRisk })
+    const bodyObj = {
+      order:     orderPayload,
+      owner:     this.wallet.address,          // requerido — faltaba en versión anterior
+      orderType: 'GTC',
+      negRisk,
+    }
+    const body      = JSON.stringify(bodyObj)
     const path      = '/order'
     const timestamp = Math.floor(Date.now() / 1000)
 
     const l2Headers = buildL2Headers(creds, 'POST', path, body, timestamp)
 
-    // ── 5. Enviar al CLOB REST API ────────────────────────────────────────
+    // ── 6. Enviar al CLOB REST API ────────────────────────────────────────
+    // Log completo del payload para debug — muestra todo excepto la private key
+    console.log('[CLOB] ── PAYLOAD COMPLETO ──────────────────────────────')
+    console.log('[CLOB] URL:    POST https://clob.polymarket.com/order')
+    console.log('[CLOB] domain: ' + JSON.stringify({ name: domain.name, verifyingContract: exchange }))
+    console.log('[CLOB] body:   ' + body)
+    console.log('[CLOB] ────────────────────────────────────────────────────')
     console.log('[CLOB] Enviando orden al CLOB REST API…')
     let res: Response
     try {
