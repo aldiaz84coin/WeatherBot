@@ -189,7 +189,15 @@ export class ClobClient {
     await this.diagnoseProxyOnce()
 
     const creds   = await this.getCredentials()
-    const negRisk = params.negRisk ?? await this.getNegRisk(params.tokenId)
+
+    // Resolver negRisk: siempre consultamos Gamma (ignoramos params.negRisk
+    // para evitar que un valor cacheado o false explícito nos haga firmar con
+    // el dominio equivocado). Los mercados de temperatura SON negRisk.
+    console.log(`[CLOB] Resolviendo negRisk para token ${params.tokenId.substring(0, 16)}…`)
+    console.log(`[CLOB]   params.negRisk recibido = ${params.negRisk}`)
+    const negRiskFromGamma = await this.getNegRisk(params.tokenId)
+    const negRisk = params.negRisk ?? negRiskFromGamma
+    console.log(`[CLOB]   negRisk FINAL = ${negRisk} (gamma: ${negRiskFromGamma}, params: ${params.negRisk})`)
 
     // Log detalles del mercado para debug
     await this.logMarketInfo(params.tokenId)
@@ -366,19 +374,32 @@ export class ClobClient {
   }
 
   // ── getNegRisk ────────────────────────────────────────────────────────────
-  // Consulta si el token es negRisk via REST (igual que Python)
+  // Consulta si el token es negRisk via Gamma API.
+  // IMPORTANTE: CLOB API no acepta clob_token_ids como param → hay que usar Gamma.
 
   async getNegRisk(tokenId: string): Promise<boolean> {
     try {
       const res = await fetch(
-        `${CLOB_HOST}/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
+        `https://gamma-api.polymarket.com/markets?clob_token_ids=${encodeURIComponent(tokenId)}`,
         { signal: AbortSignal.timeout(8_000) }
       )
-      if (!res.ok) return false
+      if (!res.ok) {
+        console.warn(`[CLOB] Gamma /markets respondió ${res.status} — negRisk=false por defecto`)
+        return false
+      }
       const data = await res.json() as any
       const markets: any[] = Array.isArray(data) ? data : (data?.data ?? [])
-      return !!markets[0]?.neg_risk
-    } catch {
+      const m = markets[0]
+      if (!m) {
+        console.warn(`[CLOB] Gamma no devolvió mercado para token → negRisk=false por defecto`)
+        return false
+      }
+      // Gamma API usa "negRisk" (camelCase); CLOB API usa "neg_risk" (snake_case).
+      const isNegRisk = !!(m.negRisk ?? m.neg_risk)
+      console.log(`[CLOB] getNegRisk(${tokenId.substring(0, 16)}…) = ${isNegRisk}`)
+      return isNegRisk
+    } catch (err: any) {
+      console.warn(`[CLOB] Error en getNegRisk: ${err?.message} — negRisk=false por defecto`)
       return false
     }
   }
