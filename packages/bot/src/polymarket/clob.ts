@@ -406,8 +406,12 @@ export class ClobClient {
         return 0
       }
       const data = await res.json() as any
-      // Respuesta: { "fee_rate_bps": "0" } o { "fee_rate_bps": "100" }
-      const rate = parseInt(data?.fee_rate_bps ?? data?.feeRateBps ?? '0', 10)
+      // Respuesta: { "base_fee": 1000 } (API reference oficial)
+      // Aunque algunos docs mencionan "fee_rate_bps", el campo real es "base_fee".
+      const rate = parseInt(
+        data?.base_fee ?? data?.fee_rate_bps ?? data?.feeRateBps ?? '0',
+        10
+      )
       return isNaN(rate) ? 0 : rate
     } catch (err) {
       console.warn('[CLOB] No se pudo consultar fee-rate:', err, '— usando 0')
