@@ -391,12 +391,21 @@ export class ClobClient {
     if (this.diagnosedProxy) return
     this.diagnosedProxy = true
 
-    const rpcUrl = process.env.POLYGON_RPC_URL ?? 'https://polygon-rpc.com'
+    // Lista de RPCs públicos de Polygon con fallback automático.
+    // Define POLYGON_RPC_URL en env para usar uno propio (Alchemy/Infura).
+    const rpcUrls = [
+      process.env.POLYGON_RPC_URL,
+      'https://polygon.llamarpc.com',
+      'https://polygon.drpc.org',
+      'https://rpc.ankr.com/polygon',
+      'https://1rpc.io/matic',
+      'https://polygon-bor-rpc.publicnode.com',
+    ].filter(Boolean) as string[]
+
     const eoa = this.wallet.address
     const funderEnv = process.env.POLYMARKET_FUNDER?.trim()
 
     console.log('[CLOB-DIAG] ══════ Diagnóstico on-chain del proxy ══════')
-    console.log(`[CLOB-DIAG] RPC: ${rpcUrl}`)
     console.log(`[CLOB-DIAG] EOA (signer):   ${eoa}`)
     console.log(`[CLOB-DIAG] POLYMARKET_FUNDER (env): ${funderEnv ?? '(no definido)'}`)
 
@@ -405,8 +414,34 @@ export class ClobClient {
       'function getPolyProxyWalletAddress(address signer) external view returns (address)',
     ]
 
+    // Intenta conectarse a cada RPC hasta encontrar uno que funcione
+    let provider: ethers.JsonRpcProvider | null = null
+    let workingRpc = ''
+    for (const url of rpcUrls) {
+      try {
+        const p = new ethers.JsonRpcProvider(url, 137, { staticNetwork: true })
+        // Test rápido: getBlockNumber
+        await Promise.race([
+          p.getBlockNumber(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+        ])
+        provider = p
+        workingRpc = url
+        console.log(`[CLOB-DIAG] RPC OK: ${url}`)
+        break
+      } catch (err: any) {
+        console.log(`[CLOB-DIAG] RPC falló (${url}): ${err?.shortMessage ?? err?.message}`)
+      }
+    }
+
+    if (!provider) {
+      console.log('[CLOB-DIAG] ❌ Ningún RPC responde — no se puede diagnosticar.')
+      console.log('[CLOB-DIAG]    Añade POLYGON_RPC_URL=<tu RPC> a Railway (Alchemy/Infura)')
+      console.log('[CLOB-DIAG] ════════════════════════════════════════════')
+      return
+    }
+
     try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl)
       const exchange = new ethers.Contract(CTF_EXCHANGE, registryAbi, provider)
 
       let expectedSafe:  string | null = null
@@ -455,7 +490,7 @@ export class ClobClient {
         }
       }
     } catch (err: any) {
-      console.log(`[CLOB-DIAG] ERROR conectando a Polygon RPC: ${err?.shortMessage ?? err?.message}`)
+      console.log(`[CLOB-DIAG] ERROR consultando contrato: ${err?.shortMessage ?? err?.message}`)
     }
 
     console.log('[CLOB-DIAG] ════════════════════════════════════════════')
