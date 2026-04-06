@@ -82,9 +82,16 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
   // ── 4. P&L ────────────────────────────────────────────────────────────────
   // Si ganamos: el token resuelto a 1 USDC/share → gross = shares, neto = shares - stake
   // Si perdemos: neto = -stake
+  // Fallback: si cycle.shares es null (ciclos antiguos), recalcular desde stake/(priceA+priceB)
+  let sharesEff: number | null = cycle.shares ?? null
+  if (sharesEff == null && cycle.price_a != null && cycle.price_b != null) {
+    const priceSum = cycle.price_a + cycle.price_b
+    if (priceSum > 0) sharesEff = cycle.stake_usdc / priceSum
+  }
+
   let pnl: number
-  if (won && cycle.shares) {
-    const gross = parseFloat((cycle.shares * 1).toFixed(4))
+  if (won && sharesEff) {
+    const gross = parseFloat((sharesEff * 1).toFixed(4))
     pnl = parseFloat((gross - cycle.stake_usdc).toFixed(4))
   } else {
     pnl = parseFloat((-cycle.stake_usdc).toFixed(4))
@@ -118,7 +125,7 @@ export async function settleBettingCycle(targetDate?: string): Promise<void> {
       actual_temp:      actualTemp,
       won,
       winning_position: winningPos,
-      pnl_gross_usdc:   won && cycle.shares ? cycle.shares : 0,
+      pnl_gross_usdc:   won && sharesEff ? sharesEff : 0,
       cost_usdc:        cycle.stake_usdc,
       source:           'polymarket',
     }, { onConflict: 'prediction_id' })
