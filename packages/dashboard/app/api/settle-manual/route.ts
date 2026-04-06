@@ -123,9 +123,15 @@ export async function POST(req: NextRequest) {
     ? (roundedTemp === cycle.token_a_temp ? cycle.token_a_temp : cycle.token_b_temp)
     : null
 
+  let sharesEff: number | null = cycle.shares ?? null
+  if (sharesEff == null && cycle.price_a != null && cycle.price_b != null) {
+    const priceSum = cycle.price_a + cycle.price_b
+    if (priceSum > 0) sharesEff = cycle.stake_usdc / priceSum
+  }
+
   let pnl: number
-  if (won && cycle.shares) {
-    const gross = parseFloat((cycle.shares * 1).toFixed(4))
+  if (won && sharesEff) {
+    const gross = parseFloat((sharesEff * 1).toFixed(4))
     pnl = parseFloat((gross - cycle.stake_usdc).toFixed(4))
   } else {
     pnl = parseFloat((-cycle.stake_usdc).toFixed(4))
@@ -153,7 +159,7 @@ export async function POST(req: NextRequest) {
                      : winningToken === cycle.token_b_temp ? 'b'
                      : null
 
-    const grossUsdc = won && cycle.shares ? parseFloat((cycle.shares * 1).toFixed(4)) : 0
+    const grossUsdc = won && sharesEff ? parseFloat((sharesEff * 1).toFixed(4)) : 0
 
     await supabase.from('results').upsert({
       prediction_id:    cycle.prediction_id,
